@@ -20,7 +20,7 @@ struct co_stack {
     size_t  total;
 };
 
-enum co_state { CO_READY, CO_RUNNING, CO_SUSPENDED, CO_DONE };
+enum co_state { CO_READY, CO_RUNNING, CO_SUSPENDED, CO_DONE , CO_WAITING};
 
 struct coroutine {
     struct co_context context;
