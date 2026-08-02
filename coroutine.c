@@ -91,7 +91,7 @@ co_result co_resume(coroutine *target)
     if (target->owner_token != &thread_token)  return CO_RESULT_WRONG_THREAD;
     if (target->state == CO_RUNNING)           return CO_RESULT_ALREADY_RUNNING;
     if (target->state == CO_DONE)              return CO_RESULT_FINISHED;
-    if(target->state == CO_WAITING) return CO_RESULT_INVALID_STATE;
+    if (target->state == CO_WAITING)           return CO_RESULT_INVALID_STATE;
     if (target->state != CO_READY &&
         target->state != CO_SUSPENDED)         return CO_RESULT_INVALID_STATE;
 
@@ -107,6 +107,7 @@ co_result co_resume(coroutine *target)
     current_coroutine = caller;
     caller->state     = CO_RUNNING;
     target->caller    = NULL;
+
     return CO_RESULT_OK;
 }
 
@@ -122,7 +123,7 @@ co_result co_yield_now(void)
     if (!self->caller) return CO_RESULT_NO_CALLER;
 
     caller            = self->caller;
-    self->state = CO_SUSPENDED;
+    self->state       = CO_SUSPENDED;
     current_coroutine = caller;
 
     co_context_switch(&self->context, &caller->context);
@@ -139,9 +140,9 @@ co_result co_destroy(coroutine *co)
     if (co->owner_token != &thread_token)   return CO_RESULT_WRONG_THREAD;
     if (co->state == CO_RUNNING)            return CO_RESULT_ALREADY_RUNNING;
     /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
-    if (co->state == CO_SUSPENDED||
+    if (co->state == CO_SUSPENDED ||
         co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
-    
+
     co_stack_destroy(&co->stack);
     free(co);
     return CO_RESULT_OK;

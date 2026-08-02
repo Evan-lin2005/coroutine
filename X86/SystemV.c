@@ -6,6 +6,7 @@
 #endif
 
 #include "coroutine_internal.h"
+#include "co_context_sys.h"
 
 #include <stdatomic.h>
 #include <stddef.h>
@@ -23,6 +24,8 @@
 #else
 #  define CO_THREAD_LOCAL _Thread_local
 #endif
+
+
 
 /* ------------------------------------------------------------------ *
  * context：欄位順序與 sysv.S 的偏移量，用 _Static_assert 綁定
