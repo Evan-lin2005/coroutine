@@ -9,8 +9,10 @@
 
 #include <stdlib.h>
 
-/* C23/C11 版本差異 */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+/* 考慮不同compiler的差異 */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define CO_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 #  define CO_THREAD_LOCAL thread_local
 #else
 #  define CO_THREAD_LOCAL _Thread_local
