@@ -2,17 +2,10 @@
 #define COROUTINE_INTERNAL_H
 
 #include "coroutine.h"
-
+#include "co_context.h"
 #include <stddef.h>
 #include <stdint.h>
 
-struct co_context {
-    void     *rsp;
-    uint64_t  rbx, rbp, r12, r13, r14, r15;
-    uint32_t  mxcsr;
-    uint16_t  x87cw;
-    uint16_t  pad;
-};
 
 struct co_stack {
     void   *base;
