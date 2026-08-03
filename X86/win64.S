@@ -3,7 +3,7 @@
  *
  * co_context_switch(from, to): rcx = from, rdx = to
  *
- * Layout (match co_context_win64.h / Window64.c asserts):
+ * Layout (must match co_context_win64.h / Win64.c asserts):
  *   +0   rsp
  *   +8   rbx
  *   +16  rbp
@@ -49,31 +49,30 @@ co_context_switch:
     movaps %xmm14,208(%rcx)
     movaps %xmm15,224(%rcx)
 
+    /* ---- restore to (rdx); rdx stays as to-pointer (not in co_context) ---- */
+    movaps 80(%rdx),  %xmm6
+    movaps 96(%rdx),  %xmm7
+    movaps 112(%rdx), %xmm8
+    movaps 128(%rdx), %xmm9
+    movaps 144(%rdx), %xmm10
+    movaps 160(%rdx), %xmm11
+    movaps 176(%rdx), %xmm12
+    movaps 192(%rdx), %xmm13
+    movaps 208(%rdx), %xmm14
+    movaps 224(%rdx), %xmm15
 
-    /* ---- restore to (r8) ---- */
-    movaps 80(%r8),  %xmm6
-    movaps 96(%r8),  %xmm7
-    movaps 112(%r8), %xmm8
-    movaps 128(%r8), %xmm9
-    movaps 144(%r8), %xmm10
-    movaps 160(%r8), %xmm11
-    movaps 176(%r8), %xmm12
-    movaps 192(%r8), %xmm13
-    movaps 208(%r8), %xmm14
-    movaps 224(%r8), %xmm15
+    ldmxcsr 72(%rdx)
+    fldcw   76(%rdx)
 
-    ldmxcsr 72(%r8)
-    fldcw   76(%r8)
-
-    movq  8(%r8),  %rbx
-    movq 16(%r8),  %rbp
-    movq 24(%r8),  %rdi
-    movq 32(%r8),  %rsi
-    movq 40(%r8),  %r12
-    movq 48(%r8),  %r13
-    movq 56(%r8),  %r14
-    movq 64(%r8),  %r15
-    movq  0(%r8),  %rsp
+    movq  8(%rdx),  %rbx
+    movq 16(%rdx),  %rbp
+    movq 24(%rdx),  %rdi
+    movq 32(%rdx),  %rsi
+    movq 40(%rdx),  %r12
+    movq 48(%rdx),  %r13
+    movq 56(%rdx),  %r14
+    movq 64(%rdx),  %r15
+    movq  0(%rdx),  %rsp
 
     ret
 
