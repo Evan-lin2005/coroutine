@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <windows.h>
 
 /* ------------------------------------------------------------------ *
@@ -24,6 +25,79 @@ _Static_assert(offsetof(struct co_context, pad)   == 78, "win64.S 假設 pad @78
 _Static_assert(offsetof(struct co_context, xmm)   == 80, "win64.S 假設 xmm @80");
 _Static_assert(sizeof(void (*)(void)) == 8, "assumes 64-bit flat function pointers");
 
+#ifndef CO_MAX_TRACKED_STACKS
+#  define CO_MAX_TRACKED_STACKS 4096 //堆疊大小
+#endif
+
+struct guard_entry {
+    _Atomic(void *) base;
+    _Atomic size_t  total;
+};
+static struct guard_entry g_guards[CO_MAX_TRACKED_STACKS];
+
+static void guard_register(const struct co_stack *s)
+{
+    for (size_t i = 0; i < CO_MAX_TRACKED_STACKS; i++) {
+        void *expect = NULL;
+        //比較內存值以決定是否寫入新值
+        if (atomic_compare_exchange_strong(&g_guards[i].base, &expect, s->base)) {
+            //以不可分割的原子操作將值寫入共用變數
+            atomic_store(&g_guards[i].total, s->total);
+            return;
+        }
+    }
+    /* 表滿：溢位仍會被 guard page 擋下，只是訊息會退化成一般 SIGSEGV */
+}
+
+//註銷一個協程堆疊。
+static void guard_unregister(const struct co_stack *s)
+{
+    for (size_t i = 0; i < CO_MAX_TRACKED_STACKS; i++)
+        //找出指定堆疊地址
+        if (atomic_load(&g_guards[i].base) == s->base) {
+            atomic_store(&g_guards[i].base, NULL);
+            return;
+        }
+}
+
+//檢查記憶體地址，是否落在任何目前正受到保護的協程堆疊範圍內
+static int addr_in_guard(const void *addr)
+{
+    uintptr_t a = (uintptr_t)addr;
+    for (size_t i = 0; i < CO_MAX_TRACKED_STACKS; i++) {
+        void *b = atomic_load(&g_guards[i].base);
+        if (!b) continue;
+        uintptr_t lo = (uintptr_t)b;
+        size_t    n  = atomic_load(&g_guards[i].total);
+        if (a >= lo && a < lo + n) return 1;
+    }
+    return 0;
+}
+
+static LONG WINAPI co_veh(EXCEPTION_POINTERS *info){
+    EXCEPTION_RECORD *er = info->ExceptionRecord;
+
+    if(er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION){
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    //故障位址
+    void* addr = (void *)er->ExceptionInformation[1];
+    if(!addr_in_guard(addr)){
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static const char msg[] =
+        "*** coroutine stack overflow (guard page hit)\n";
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (err && err != INVALID_HANDLE_VALUE) {
+        DWORD n;
+        WriteFile(err, msg, (DWORD)(sizeof msg - 1), &n, NULL);
+    }
+    ExitProcess(139);          /* 結束；不要 CONTINUE_EXECUTION */
+    return EXCEPTION_CONTINUE_SEARCH; /* 不可達 */
+}
+
 static size_t page_size(void)
 {
     static size_t ps;
@@ -37,7 +111,9 @@ static size_t page_size(void)
 
 int co_platform_initialize(void)
 {
-    /* 基本切換不需 altstack / VEH；溢位保護之後再加 */
+    static LONG once;  
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, co_veh);  
     return 0;
 }
 
@@ -63,12 +139,16 @@ int co_stack_create(struct co_stack *s, size_t want)
     s->lo    = (char *)base + ps;
     s->hi    = (char *)base + ps + usable;
     s->total = total;
+
+    guard_register(s);
+
     return 0;
 }
 
 void co_stack_destroy(struct co_stack *s)
 {
     if (!s || !s->base) return;
+    guard_unregister(s);
     VirtualFree(s->base, 0, MEM_RELEASE);
     memset(s, 0, sizeof *s);
 }
