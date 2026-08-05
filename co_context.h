@@ -4,7 +4,9 @@
 #if defined(_WIN32)
 
 #   include "platform/Windows_x64/co_context_win64.h"
+#elif defined(__APPLE__) && defined(__arm64__)
 
+#   include "platform/macos_arm64/co_context_macos.h"
 #elif defined(__x86_64__) || defined(__amd64__)
 
 #   include "platform/Linux_x86/co_context_sys.h"
