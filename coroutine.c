@@ -58,20 +58,25 @@ void co_bad_return(void) { abort(); }
 /* ------------------------------------------------------------------ *
  * public API
  * ------------------------------------------------------------------ */
-coroutine *co_create(size_t stack_size, co_function function, void *argument)
+co_result co_create_ex(size_t stack_size, co_function function, void *argument,
+                      coroutine **out)
 {
     struct coroutine *co;
 
+    if (!out) return CO_RESULT_INVALID_ARGUMENT;
+    *out = NULL;
+
     ensure_initialized();
 
-    if (!function || stack_size < CO_MIN_STACK_SIZE) return NULL;
+    if (!function || stack_size < CO_MIN_STACK_SIZE)
+        return CO_RESULT_INVALID_ARGUMENT;
 
     co = calloc(1, sizeof *co);
-    if (!co) return NULL;
+    if (!co) return CO_RESULT_OUT_OF_MEMORY;
 
     if (co_stack_create(&co->stack, stack_size) != 0) {
         free(co);
-        return NULL;
+        return CO_RESULT_OUT_OF_MEMORY;
     }
 
     co->function    = function;
@@ -80,6 +85,16 @@ coroutine *co_create(size_t stack_size, co_function function, void *argument)
     co->owner_token = &thread_token;
 
     initialize_context(co);
+    *out = co;
+    return CO_RESULT_OK;
+}
+
+coroutine *co_create(size_t stack_size, co_function function, void *argument)
+{
+    coroutine *co = NULL;
+
+    if (co_create_ex(stack_size, function, argument, &co) != CO_RESULT_OK)
+        return NULL;
     return co;
 }
 

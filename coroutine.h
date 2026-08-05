@@ -31,7 +31,22 @@ typedef struct coroutine coroutine;
  */
 typedef void (*co_function)(void *argument);
 
+/*
+ * co_create — 簡便建立協程。
+ * 成功回傳 coroutine *；任一失敗（參數不合法或 OOM）皆回 NULL，無法區分原因。
+ * 若需明確錯誤碼（例如 CO_RESULT_OUT_OF_MEMORY），請改用 co_create_ex。
+ */
 coroutine *co_create(size_t stack_size, co_function function, void *argument);
+
+/*
+ * co_create_ex — 建立協程並回傳 co_result。
+ * 成功：CO_RESULT_OK，*out 指向新協程（*out 不可為 NULL）。
+ * 失敗：*out 設為 NULL，並回傳
+ *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、或 stack_size 小於 CO_MIN_STACK_SIZE
+ *   CO_RESULT_OUT_OF_MEMORY    — calloc 或平台 stack 配置失敗
+ */
+co_result  co_create_ex(size_t stack_size, co_function function, void *argument,
+                        coroutine **out);
 co_result  co_resume(coroutine *co);
 co_result  co_yield_now(void);
 co_result  co_destroy(coroutine *co);
