@@ -76,7 +76,12 @@ static void guard_register(const struct co_stack *s)
             return;
         }
     }
-    /* 表滿：溢位仍會被 guard page 擋下，只是訊息會退化成一般 SIGSEGV */
+    /* 表滿：以 hash slot 強制登記，讓 guard page 溢位仍能辨識 */
+    {
+        size_t i = ((uintptr_t)s->base >> 12) % CO_MAX_TRACKED_STACKS;
+        atomic_store(&g_guards[i].base, s->base);
+        atomic_store(&g_guards[i].total, s->total);
+    }
 }
 
 //註銷一個協程堆疊。
