@@ -32,6 +32,15 @@ typedef struct coroutine coroutine;
 typedef void (*co_function)(void *argument);
 
 /*
+ * 平台暫存器契約：
+ * - x86_64 SystemV / Win64：切換保存 callee-saved GPR、MXCSR/x87 CW；Win64 另保存 xmm6–xmm15。
+ * - AArch64：保存 x19–x28、fp（x29）、d8–d15。
+ * - AArch64 不保存 FPCR/FPSR（非 ABI callee-saved）；跨切換後 FP 環境暫存器可能改變，屬預期行為。
+ *
+ * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy。
+ */
+
+/*
  * co_create — 簡便建立協程。
  * 成功回傳 coroutine *；任一失敗（參數不合法或 OOM）皆回 NULL，無法區分原因。
  * 若需明確錯誤碼（例如 CO_RESULT_OUT_OF_MEMORY），請改用 co_create_ex。

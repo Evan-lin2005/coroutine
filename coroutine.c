@@ -7,6 +7,8 @@
 
 #include "coroutine_internal.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 /* 考慮不同compiler的差異 */
@@ -16,6 +18,80 @@
 #  define CO_THREAD_LOCAL thread_local
 #else
 #  define CO_THREAD_LOCAL _Thread_local
+#endif
+
+/*
+ * ASan fiber 切換註解
+ * ----------------------------------------------------------------
+ * 依 LLVM sanitizer 契約：start 在切換前呼叫（fake_stack 存於 from 協程），
+ * finish 在目標 stack 開始執行時（trampoline）或切換返回 from 時呼叫。
+ * - fake_stack_save 傳 NULL（目前不啟用 use-after-return fake stack 追蹤）。
+ */
+#if defined(__SANITIZE_ADDRESS__)
+extern void __sanitizer_start_switch_fiber(void **fake_stack_save,
+                                           const void *bottom,
+                                           size_t size);
+extern void __sanitizer_finish_switch_fiber(void *fake_stack_save,
+                                            const void **bottom_old,
+                                            size_t *size_old);
+
+static size_t co_asan_stack_bytes(const struct co_stack *st)
+{
+    if (!st || !st->lo || !st->hi || st->hi <= st->lo)
+        return 0;
+    return (size_t)(st->hi - st->lo);
+}
+
+static void co_asan_start_switch(struct coroutine *from_co,
+                                 const struct coroutine *to_co)
+{
+    const void *bottom = NULL;
+    size_t      size   = 0;
+    (void)from_co;
+
+    if (to_co && to_co->stack.lo)
+        size = co_asan_stack_bytes(&to_co->stack);
+    if (size)
+        bottom = to_co->stack.lo;
+
+    /* fake_stack_save=NULL：目前僅需 stack 邊界註解，不啟用 use-after-return fake stack */
+    __sanitizer_start_switch_fiber(NULL, bottom, size);
+}
+
+static void co_asan_finish_switch(void)
+{
+    const void *bottom_old = NULL;
+    size_t      size_old   = 0;
+    __sanitizer_finish_switch_fiber(NULL, &bottom_old, &size_old);
+}
+
+static void co_do_switch(struct co_context *from, struct co_context *to,
+                         struct coroutine *from_co, struct coroutine *to_co)
+{
+    (void)from_co;
+    co_asan_start_switch(from_co, to_co);
+    co_context_switch(from, to);
+    co_asan_finish_switch();
+}
+
+static void co_asan_finish_on_enter(struct coroutine *from_co)
+{
+    (void)from_co;
+    co_asan_finish_switch();
+}
+#else
+static void co_do_switch(struct co_context *from, struct co_context *to,
+                         struct coroutine *from_co, struct coroutine *to_co)
+{
+    (void)from_co;
+    (void)to_co;
+    co_context_switch(from, to);
+}
+
+static void co_asan_finish_on_enter(struct coroutine *from_co)
+{
+    (void)from_co;
+}
 #endif
 
 /* ------------------------------------------------------------------ *
@@ -43,13 +119,16 @@ void co_trampoline_body(void)
     struct coroutine *self = current_coroutine;
     struct coroutine *caller;
 
+    /* P0：首次進入 fiber 時 finish 來自 caller 的 start_switch 狀態 */
+    co_asan_finish_on_enter(self->caller);
+
     self->function(self->argument);   /* C 沒有例外可攔截；契約見標頭 */
 
     self->state       = CO_DONE;
     caller            = self->caller;
     current_coroutine = caller;
 
-    co_context_switch(&self->context, &caller->context);
+    co_do_switch(&self->context, &caller->context, self, caller);
     abort();    /* 已完成的協程不該被再次進入 */
 }
 
@@ -118,7 +197,7 @@ co_result co_resume(coroutine *target)
     target->state     = CO_RUNNING;
     current_coroutine = target;
 
-    co_context_switch(&caller->context, &target->context);
+    co_do_switch(&caller->context, &target->context, caller, target);
 
     /* target yield 或結束後，控制流恢復 */
     current_coroutine = caller;
@@ -143,7 +222,7 @@ co_result co_yield_now(void)
     self->state       = CO_SUSPENDED;
     current_coroutine = caller;
 
-    co_context_switch(&self->context, &caller->context);
+    co_do_switch(&self->context, &caller->context, self, caller);
 
     current_coroutine = self;
     self->state       = CO_RUNNING;
