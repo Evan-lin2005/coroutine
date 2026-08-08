@@ -62,7 +62,8 @@ coroutine *co_create(size_t stack_size, co_function function, void *argument);
  * co_create_ex — 建立協程並回傳 co_result。
  * 成功：CO_RESULT_OK，*out 指向新協程（*out 不可為 NULL）。
  * 失敗：*out 設為 NULL，並回傳
- *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、或 stack_size 小於 CO_MIN_STACK_SIZE
+ *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、stack_size 小於 CO_MIN_STACK_SIZE、
+ *     或自訂 allocator 回傳未達 _Alignof(struct coroutine) 對齊的指標
  *   CO_RESULT_OUT_OF_MEMORY    — 物件 allocator 或平台 stack 配置失敗
  *
  * argument 語意同 co_create（userdata，與 resume/yield 傳值分離）。
@@ -151,7 +152,9 @@ size_t     co_storage_size(coroutine *co);
  * co_allocator：
  *   - alloc(size, ud) — 配置 size 位元組；成功回傳指標或 NULL。
  *     庫在 co_create_ex 傳入 sizeof(struct coroutine)；自訂 alloc 不保證清零，
- *     庫會在自訂路徑 memset。
+ *     庫會在自訂路徑 memset。回傳指標須滿足 _Alignof(struct coroutine) 對齊
+ *     （Linux x86 通常 8、Win64 為 16）；未達標回 CO_RESULT_INVALID_ARGUMENT
+ *     （debug build 另 assert）。CO_ALLOC_ALIGN 為跨平台最壞情況上限承諾。
  *   - free(ptr, size, ud) — 釋放先前 alloc 回傳的 ptr；size 與 alloc 時相同。
  *     可為 NULL：arena / bump 等不逐筆回收時，co_destroy 對控制塊為 no-op。
  *   - userdata — 每次 alloc/free 傳入，可綁 arena / pool 上下文。
@@ -163,7 +166,7 @@ size_t     co_storage_size(coroutine *co);
  *   - alloc 為 NULL 但 free 非 NULL：視為無效，還原預設 libc。
  *   - 已有活協程時更換 allocator 為 Undefined Behavior；建議程式啟動、尚未 co_create 時設定。
  */
-#define CO_ALLOC_ALIGN 16u
+#define CO_ALLOC_ALIGN 16u /* 跨平台最壞情況；執行期校驗用 _Alignof(struct coroutine) */
 
 typedef struct co_allocator {
     void *(*alloc)(size_t size, void *ud);

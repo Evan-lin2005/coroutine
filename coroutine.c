@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 /* 考慮不同compiler的差異 */
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -124,27 +125,42 @@ static co_allocator g_allocator;
 _Static_assert(_Alignof(struct coroutine) <= CO_ALLOC_ALIGN,
                "struct coroutine alignment exceeds CO_ALLOC_ALIGN");
 
+enum { co_obj_align = _Alignof(struct coroutine) };
+
 static int co_ptr_aligned(const void *p)
 {
-    return ((uintptr_t)p % CO_ALLOC_ALIGN) == 0;
+    const uintptr_t mask = (uintptr_t)co_obj_align - 1u;
+    return ((uintptr_t)p & mask) == 0;
 }
 
-static void *co_mem_alloc(size_t n)
+static co_result co_mem_alloc(size_t n, void **out)
 {
     void *p;
 
-    if (!g_allocator.alloc)
-        return calloc(1, n);
+    if (!out)
+        return CO_RESULT_INVALID_ARGUMENT;
+    *out = NULL;
+
+    if (!g_allocator.alloc) {
+        p = calloc(1, n);
+        if (!p)
+            return CO_RESULT_OUT_OF_MEMORY;
+        *out = p;
+        return CO_RESULT_OK;
+    }
 
     p = g_allocator.alloc(n, g_allocator.userdata);
     if (!p)
-        return NULL;
+        return CO_RESULT_OUT_OF_MEMORY;
     if (!co_ptr_aligned(p)) {
         if (g_allocator.free)
             g_allocator.free(p, n, g_allocator.userdata);
-        return NULL;
+        assert(co_ptr_aligned(p) &&
+               "custom allocator: pointer not aligned to _Alignof(struct coroutine)");
+        return CO_RESULT_INVALID_ARGUMENT;
     }
-    return p;
+    *out = p;
+    return CO_RESULT_OK;
 }
 
 static void co_mem_free(void *p, size_t n)
@@ -214,9 +230,11 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
     if (!function || stack_size < CO_MIN_STACK_SIZE)
         return CO_RESULT_INVALID_ARGUMENT;
 
-    co = co_mem_alloc(sizeof *co);
-    if (!co)
-        return CO_RESULT_OUT_OF_MEMORY;
+    co_result ar;
+
+    ar = co_mem_alloc(sizeof *co, (void **)&co);
+    if (ar != CO_RESULT_OK)
+        return ar;
     if (g_allocator.alloc)
         memset(co, 0, sizeof *co);
 
