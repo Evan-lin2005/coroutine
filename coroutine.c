@@ -111,6 +111,10 @@ static void ensure_initialized(void)
     }
 }
 
+static void *co_exchange_and_switch(struct coroutine *from,
+                                    struct coroutine *to,
+                                    void *data);
+
 /* ------------------------------------------------------------------ *
  * trampoline
  * ------------------------------------------------------------------ */
@@ -122,11 +126,14 @@ void co_trampoline_body(void)
     /* P0：首次進入 fiber 時 finish 來自 caller 的 start_switch 狀態 */
     co_asan_finish_on_enter(self->caller);
 
-    self->function(self->argument);   /* C 沒有例外可攔截；契約見標頭 */
+    self->function(self->transfer);   /* C 沒有例外可攔截；契約見標頭 */
 
     self->state       = CO_DONE;
     caller            = self->caller;
     current_coroutine = caller;
+
+    /* 結束切回 caller 前清空其信箱，避免 co_resume 讀到過期 transfer */
+    caller->transfer = NULL;
 
     co_do_switch(&self->context, &caller->context, self, caller);
     abort();    /* 已完成的協程不該被再次進入 */
@@ -177,7 +184,7 @@ coroutine *co_create(size_t stack_size, co_function function, void *argument)
     return co;
 }
 
-co_result co_resume(coroutine *target)
+co_result co_resume(coroutine *target,void *arg,void **out)
 {
     struct coroutine *caller;
 
@@ -197,8 +204,10 @@ co_result co_resume(coroutine *target)
     target->state     = CO_RUNNING;
     current_coroutine = target;
 
-    co_do_switch(&caller->context, &target->context, caller, target);
+    void *got = co_exchange_and_switch(caller, target, arg);
 
+    if (out)
+        *out = (target->state == CO_DONE) ? NULL : got;
     /* target yield 或結束後，控制流恢復 */
     current_coroutine = caller;
     caller->state     = CO_RUNNING;
@@ -207,7 +216,7 @@ co_result co_resume(coroutine *target)
     return CO_RESULT_OK;
 }
 
-co_result co_yield_now(void)
+co_result co_yield_now(void* arg,void **out)
 {
     struct coroutine *self = current_coroutine;
     struct coroutine *caller;
@@ -222,11 +231,22 @@ co_result co_yield_now(void)
     self->state       = CO_SUSPENDED;
     current_coroutine = caller;
 
-    co_do_switch(&self->context, &caller->context, self, caller);
+    void *got = co_exchange_and_switch(self, caller, arg);
+    if (out)
+        *out = got;
 
     current_coroutine = self;
     self->state       = CO_RUNNING;
     return CO_RESULT_OK;
+}
+
+static void *co_exchange_and_switch(struct coroutine *from,
+    struct coroutine *to,
+    void *data)
+{
+    to->transfer = data;
+    co_do_switch(&from->context, &to->context, from, to);
+    return from->transfer;
 }
 
 co_result co_destroy(coroutine *co)
@@ -263,4 +283,29 @@ size_t co_stack_peak(const coroutine *co)
     (void)co;
     return 0;
 #endif
+}
+
+co_result co_set_storage(coroutine *co, void *buf, size_t cap)
+{
+    if (!co) return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_token != &thread_token) return CO_RESULT_WRONG_THREAD;
+    if (co->state != CO_READY) return CO_RESULT_INVALID_STATE;
+    if (buf && cap == 0) return CO_RESULT_INVALID_ARGUMENT;
+    if (!buf && cap > 0) return CO_RESULT_INVALID_ARGUMENT;
+
+    co->storage_buffer = buf;
+    co->st_cap         = cap;
+    return CO_RESULT_OK;
+}
+
+void *co_storage(coroutine *co)
+{
+    if (!co || co->st_cap == 0) return NULL;
+    return co->storage_buffer;
+}
+
+size_t co_storage_size(coroutine *co)
+{
+    if (!co) return 0;
+    return co->st_cap;
 }

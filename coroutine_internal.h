@@ -20,9 +20,12 @@ struct coroutine {
     struct co_stack   stack;
     co_function       function;
     void             *argument;
+    void             *transfer;
     struct coroutine *caller;
     enum co_state     state;
     const void       *owner_token;
+    void *  storage_buffer;
+    size_t  st_cap;
 };
 
 void co_context_switch(struct co_context *from, struct co_context *to);
