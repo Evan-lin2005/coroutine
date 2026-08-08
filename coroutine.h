@@ -153,12 +153,14 @@ size_t     co_storage_size(coroutine *co);
  *     庫在 co_create_ex 傳入 sizeof(struct coroutine)；自訂 alloc 不保證清零，
  *     庫會在自訂路徑 memset。
  *   - free(ptr, size, ud) — 釋放先前 alloc 回傳的 ptr；size 與 alloc 時相同。
+ *     可為 NULL：arena / bump 等不逐筆回收時，co_destroy 對控制塊為 no-op。
  *   - userdata — 每次 alloc/free 傳入，可綁 arena / pool 上下文。
  *
  * co_set_allocator(a)：
  *   - 進程級：拷貝 *a 到庫內 g_allocator（非持有指標）；之後 create/destroy 皆用此副本。
- *   - a == NULL：還原預設 libc（calloc / free）。
- *   - 設自訂時 alloc 與 free 皆非 NULL。
+ *   - a == NULL，或 alloc 與 free 皆 NULL：還原預設 libc（calloc / free）。
+ *   - 設自訂時 alloc 必須非 NULL；free 可為 NULL（僅 alloc 的 arena 語意）。
+ *   - alloc 為 NULL 但 free 非 NULL：視為無效，還原預設 libc。
  *   - 已有活協程時更換 allocator 為 Undefined Behavior；建議程式啟動、尚未 co_create 時設定。
  */
 #define CO_ALLOC_ALIGN 16u

@@ -121,7 +121,6 @@ static void *co_exchange_and_switch(struct coroutine *from,
  * ------------------------------------------------------------------ */
 static co_allocator g_allocator;
 
-/* Win64 movaps 要求 co_context（第一成員）16-byte 對齊 */
 _Static_assert(_Alignof(struct coroutine) <= CO_ALLOC_ALIGN,
                "struct coroutine alignment exceeds CO_ALLOC_ALIGN");
 
@@ -130,7 +129,6 @@ static int co_ptr_aligned(const void *p)
     return ((uintptr_t)p % CO_ALLOC_ALIGN) == 0;
 }
 
-/* 預設 calloc(1,n)；自訂路徑校驗對齊，不合格則 free 並回 NULL */
 static void *co_mem_alloc(size_t n)
 {
     void *p;
@@ -142,7 +140,8 @@ static void *co_mem_alloc(size_t n)
     if (!p)
         return NULL;
     if (!co_ptr_aligned(p)) {
-        g_allocator.free(p, n, g_allocator.userdata);
+        if (g_allocator.free)
+            g_allocator.free(p, n, g_allocator.userdata);
         return NULL;
     }
     return p;
@@ -152,15 +151,21 @@ static void co_mem_free(void *p, size_t n)
 {
     if (!p)
         return;
+    if (!g_allocator.alloc) {
+        free(p);
+        return;
+    }
     if (g_allocator.free)
         g_allocator.free(p, n, g_allocator.userdata);
-    else
-        free(p);
 }
 
 void co_set_allocator(const co_allocator *a)
 {
-    if (!a) {
+    if (!a || (!a->alloc && !a->free)) {
+        memset(&g_allocator, 0, sizeof g_allocator);
+        return;
+    }
+    if (!a->alloc) {
         memset(&g_allocator, 0, sizeof g_allocator);
         return;
     }
@@ -212,7 +217,6 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
     co = co_mem_alloc(sizeof *co);
     if (!co)
         return CO_RESULT_OUT_OF_MEMORY;
-    /* calloc 已清零；自訂 alloc 不保證清零 */
     if (g_allocator.alloc)
         memset(co, 0, sizeof *co);
 
@@ -220,7 +224,6 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
         co_mem_free(co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
     }
-
     co->function    = function;
     co->argument    = argument;
     co->state       = CO_READY;
@@ -316,7 +319,7 @@ co_result co_destroy(coroutine *co)
         co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
 
     co_stack_destroy(&co->stack);
-    co_mem_free(co, sizeof(struct coroutine));
+    co_mem_free(co, sizeof *co);
     return CO_RESULT_OK;
 }
 
