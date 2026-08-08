@@ -284,3 +284,28 @@ size_t co_stack_peak(const coroutine *co)
     return 0;
 #endif
 }
+
+co_result co_set_storage(coroutine *co, void *buf, size_t cap)
+{
+    if (!co) return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_token != &thread_token) return CO_RESULT_WRONG_THREAD;
+    if (co->state != CO_READY) return CO_RESULT_INVALID_STATE;
+    if (buf && cap == 0) return CO_RESULT_INVALID_ARGUMENT;
+    if (!buf && cap > 0) return CO_RESULT_INVALID_ARGUMENT;
+
+    co->storage_buffer = buf;
+    co->st_cap         = cap;
+    return CO_RESULT_OK;
+}
+
+void *co_storage(coroutine *co)
+{
+    if (!co || co->st_cap == 0) return NULL;
+    return co->storage_buffer;
+}
+
+size_t co_storage_size(coroutine *co)
+{
+    if (!co) return 0;
+    return co->st_cap;
+}

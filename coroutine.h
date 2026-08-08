@@ -98,6 +98,38 @@ int        co_finished(const coroutine *co);
 /* 以 -DCO_DEBUG_STACK_USAGE 編譯，否則失效*/
 size_t     co_stack_peak(const coroutine *co);
 
+/*
+ * Storage 契約（可選 per-coroutine buffer，呼叫端自有記憶體）
+ * ----------------------------------------------------------------
+ * 與 transfer（每次切換傳一個 void*）、co_create 的 argument（userdata）分離：
+ *   - Storage 是綁在協程上的 byte 區，供協程內長期讀寫（跨 yield 保留內容）。
+ *   - 庫只記錄 buf 指標與 cap，不 malloc、不 free、不拷貝、不解析 layout。
+ *
+ * 典型流程：co_create → co_set_storage(co, buf, cap) → co_resume(...)；
+ * 協程內透過 co_storage(co) 取得指標（或 co_create 的 userdata 持有 co*）。
+ *
+ * co_set_storage(co, buf, cap) — 綁定或清除 storage：
+ *   - 僅允許 CO_READY（建立後、首次 co_resume 前）；跑過或掛起後回 CO_RESULT_INVALID_STATE。
+ *   - buf != NULL 且 cap > 0：綁定；可再次呼叫以替換綁定（舊 buffer 由呼叫端管理）。
+ *   - buf == NULL 且 cap == 0：清除綁定。
+ *   - buf 與 cap 僅一方為零（buf 非 NULL 但 cap==0，或 buf==NULL 但 cap>0）：
+ *     CO_RESULT_INVALID_ARGUMENT。
+ *   - 非建立執行緒：CO_RESULT_WRONG_THREAD。
+ *
+ * co_storage(co) / co_storage_size(co) — 唯讀查詢：
+ *   - 未綁定或 co==NULL：co_storage 回 NULL，co_storage_size 回 0。
+ *   - 不檢查執行緒；跨 thread 讀寫 buffer 內容為 UB。
+ *
+ * 生命週期：
+ *   - buf 須在協程仍可能存取 storage 期間有效（至少至 co_destroy 完成後才可釋放）。
+ *   - co_destroy 不觸碰 buf；與外部 stack 策略一致，buffer 由呼叫端負責保護與釋放。
+ *   - 協程掛起期間若呼叫端已釋放 buf 而協程仍持有指標 → UB。
+ *   - 對齊、struct layout、是否含指標由呼叫端負責；預設不配置，避免庫內隱式 heap。
+ */
+co_result  co_set_storage(coroutine *co, void *buf, size_t cap);
+void      *co_storage(coroutine *co);
+size_t     co_storage_size(coroutine *co);
+
 #ifdef __cplusplus
 }
 #endif
