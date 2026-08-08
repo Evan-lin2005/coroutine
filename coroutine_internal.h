@@ -20,6 +20,7 @@ struct coroutine {
     struct co_stack   stack;
     co_function       function;
     void             *argument;
+    void             *transfer;
     struct coroutine *caller;
     enum co_state     state;
     const void       *owner_token;
