@@ -140,19 +140,38 @@ int co_stack_create(struct co_stack *s, size_t want)
         return -1;
     }
 
-    s->base  = base;
-    s->lo    = (char *)base + ps;
-    s->hi    = (char *)base + ps + usable;
-    s->total = total;
+    s->base     = base;
+    s->lo       = (char *)base + ps;
+    s->hi       = (char *)base + ps + usable;
+    s->total    = total;
+    s->external = 0;
 
     guard_register(s);
 
     return 0;
 }
 
+int co_stack_create_from(struct co_stack *s, void *base, size_t total)
+{
+    if (!s || !base || total < CO_MIN_STACK_SIZE)
+        return -1;
+
+    s->base     = base;
+    s->lo       = base;
+    s->hi       = (char *)base + total;
+    s->total    = total;
+    s->external = 1;
+    return 0;
+}
+
 void co_stack_destroy(struct co_stack *s)
 {
-    if (!s || !s->base) return;
+    if (!s || !s->base)
+        return;
+    if (s->external) {
+        memset(s, 0, sizeof *s);
+        return;
+    }
     guard_unregister(s);
     VirtualFree(s->base, 0, MEM_RELEASE);
     memset(s, 0, sizeof *s);

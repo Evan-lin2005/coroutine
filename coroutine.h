@@ -63,7 +63,7 @@ coroutine *co_create(size_t stack_size, co_function function, void *argument);
  * 成功：CO_RESULT_OK，*out 指向新協程（*out 不可為 NULL）。
  * 失敗：*out 設為 NULL，並回傳
  *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、或 stack_size 小於 CO_MIN_STACK_SIZE
- *   CO_RESULT_OUT_OF_MEMORY    — calloc 或平台 stack 配置失敗
+ *   CO_RESULT_OUT_OF_MEMORY    — 物件 allocator 或平台 stack 配置失敗
  *
  * argument 語意同 co_create（userdata，與 resume/yield 傳值分離）。
  */
@@ -129,6 +129,48 @@ size_t     co_stack_peak(const coroutine *co);
 co_result  co_set_storage(coroutine *co, void *buf, size_t cap);
 void      *co_storage(coroutine *co);
 size_t     co_storage_size(coroutine *co);
+
+/*
+ * Allocator 契約（custom allocator）
+ * ----------------------------------------------------------------
+ * 配置對象：struct coroutine 控制塊（context、狀態、transfer 等）。
+ * 不經 allocator 的資源：
+ *   - 執行 stack — 預設 co_stack_create（mmap/VirtualAlloc + guard）
+ *   - storage buffer — co_set_storage 由呼叫端提供
+ *   - transfer / argument — 僅存 void*，指向呼叫端資料
+ *   - TLS main_coroutine — 靜態，不經 heap
+ *
+ * 與 transfer、storage、argument 分離：
+ *   - argument / storage 管「業務資料」；allocator 管「庫的執行控制塊」。
+ *   - 高頻 co_create/co_destroy 時，自訂 allocator 可讓控制塊走 arena/pool，
+ *     而不必讓每次 libc calloc/free。
+ *
+ * 流程：co_set_allocator(&a) → co_create / co_destroy（建議在首次 co_create 前設定）。
+ *
+ *
+ * co_allocator：
+ *   - alloc(size, ud) — 配置 size 位元組；成功回傳指標或 NULL。
+ *     庫在 co_create_ex 傳入 sizeof(struct coroutine)；自訂 alloc 不保證清零，
+ *     庫會在自訂路徑 memset。
+ *   - free(ptr, size, ud) — 釋放先前 alloc 回傳的 ptr；size 與 alloc 時相同。
+ *   - userdata — 每次 alloc/free 傳入，可綁 arena / pool 上下文。
+ *
+ * co_set_allocator(a)：
+ *   - 進程級：拷貝 *a 到庫內 g_allocator（非持有指標）；之後 create/destroy 皆用此副本。
+ *   - a == NULL：還原預設 libc（calloc / free）。
+ *   - 設自訂時 alloc 與 free 皆非 NULL。
+ *   - 已有活協程時更換 allocator 為 Undefined Behavior；建議程式啟動、尚未 co_create 時設定。
+ */
+#define CO_ALLOC_ALIGN 16u
+
+typedef struct co_allocator {
+    void *(*alloc)(size_t size, void *ud);
+    void  (*free)(void *ptr, size_t size, void *ud);
+    void  *userdata;
+} co_allocator;
+
+/* NULL = 還原預設 libc；非 NULL = 拷貝 *a 為進程級物件 allocator */
+void co_set_allocator(const co_allocator *a);
 
 #ifdef __cplusplus
 }

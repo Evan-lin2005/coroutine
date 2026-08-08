@@ -11,6 +11,7 @@ struct co_stack {
     void   *base;
     void   *lo, *hi;
     size_t  total;
+    int     external; /* 1：base 由呼叫端擁有，destroy 不 munmap/VirtualFree */
 };
 
 enum co_state { CO_READY, CO_RUNNING, CO_SUSPENDED, CO_DONE , CO_WAITING};
@@ -35,6 +36,7 @@ void co_bad_return(void);
 
 int  co_platform_initialize(void);
 int  co_stack_create(struct co_stack *s, size_t want);
+int  co_stack_create_from(struct co_stack *s, void *base, size_t total);
 void co_stack_destroy(struct co_stack *s);
 void initialize_context(struct coroutine *co);
 

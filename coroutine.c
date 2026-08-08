@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* 考慮不同compiler的差異 */
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -116,6 +117,57 @@ static void *co_exchange_and_switch(struct coroutine *from,
                                     void *data);
 
 /* ------------------------------------------------------------------ *
+ * allocator — 僅 struct coroutine；g_allocator 為 co_set_allocator 的副本
+ * ------------------------------------------------------------------ */
+static co_allocator g_allocator;
+
+/* Win64 movaps 要求 co_context（第一成員）16-byte 對齊 */
+_Static_assert(_Alignof(struct coroutine) <= CO_ALLOC_ALIGN,
+               "struct coroutine alignment exceeds CO_ALLOC_ALIGN");
+
+static int co_ptr_aligned(const void *p)
+{
+    return ((uintptr_t)p % CO_ALLOC_ALIGN) == 0;
+}
+
+/* 預設 calloc(1,n)；自訂路徑校驗對齊，不合格則 free 並回 NULL */
+static void *co_mem_alloc(size_t n)
+{
+    void *p;
+
+    if (!g_allocator.alloc)
+        return calloc(1, n);
+
+    p = g_allocator.alloc(n, g_allocator.userdata);
+    if (!p)
+        return NULL;
+    if (!co_ptr_aligned(p)) {
+        g_allocator.free(p, n, g_allocator.userdata);
+        return NULL;
+    }
+    return p;
+}
+
+static void co_mem_free(void *p, size_t n)
+{
+    if (!p)
+        return;
+    if (g_allocator.free)
+        g_allocator.free(p, n, g_allocator.userdata);
+    else
+        free(p);
+}
+
+void co_set_allocator(const co_allocator *a)
+{
+    if (!a) {
+        memset(&g_allocator, 0, sizeof g_allocator);
+        return;
+    }
+    g_allocator = *a;
+}
+
+/* ------------------------------------------------------------------ *
  * trampoline
  * ------------------------------------------------------------------ */
 void co_trampoline_body(void)
@@ -157,11 +209,15 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
     if (!function || stack_size < CO_MIN_STACK_SIZE)
         return CO_RESULT_INVALID_ARGUMENT;
 
-    co = calloc(1, sizeof *co);
-    if (!co) return CO_RESULT_OUT_OF_MEMORY;
+    co = co_mem_alloc(sizeof *co);
+    if (!co)
+        return CO_RESULT_OUT_OF_MEMORY;
+    /* calloc 已清零；自訂 alloc 不保證清零 */
+    if (g_allocator.alloc)
+        memset(co, 0, sizeof *co);
 
     if (co_stack_create(&co->stack, stack_size) != 0) {
-        free(co);
+        co_mem_free(co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
     }
 
@@ -260,7 +316,7 @@ co_result co_destroy(coroutine *co)
         co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
 
     co_stack_destroy(&co->stack);
-    free(co);
+    co_mem_free(co, sizeof(struct coroutine));
     return CO_RESULT_OK;
 }
 
