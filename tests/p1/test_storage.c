@@ -4,7 +4,6 @@
 
 #include "p1_common.h"
 
-#include <stdint.h>
 #include <string.h>
 
 typedef struct {
@@ -18,9 +17,9 @@ static void fn_storage_persist(coroutine *self, void *userdata, void *initial_in
     unsigned char *buf = co_storage(self);
 
     (void)initial_input;
-    p0_expect(__LINE__, "userdata is ctx", (intptr_t)userdata, (intptr_t)ctx);
-    p0_expect(__LINE__, "self matches ctx.co", (intptr_t)self, (intptr_t)ctx->co);
-    p0_expect(__LINE__, "storage ptr", (intptr_t)buf != 0, 1);
+    p0_expect_ptr(__LINE__, "userdata is ctx", userdata, ctx);
+    p0_expect_ptr(__LINE__, "self matches ctx.co", self, ctx->co);
+    p0_expect(__LINE__, "storage ptr nonnull", buf != NULL, 1);
     p0_expect(__LINE__, "storage size", co_storage_size(self), 16);
 
     buf[0]  = 0xAB;
@@ -50,7 +49,7 @@ void test_storage_persist_across_yield(void)
 
     p0_expect(__LINE__, "set storage",
               co_set_storage(co, backing, sizeof backing), CO_RESULT_OK);
-    p0_expect(__LINE__, "query ptr", (intptr_t)co_storage(co), (intptr_t)backing);
+    p0_expect_ptr(__LINE__, "query ptr", co_storage(co), backing);
     p0_expect(__LINE__, "query size", co_storage_size(co), 16);
 
     p0_expect(__LINE__, "resume", P1_RESUME(co), CO_RESULT_OK);
@@ -69,7 +68,7 @@ static void fn_nop(coroutine *self, void *userdata, void *initial_input)
     (void)initial_input;
 }
 
-void test_storage_set_state_and_args(void)
+void test_storage_set_state_and_meta(void)
 {
     coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_nop, NULL);
     unsigned char a[8];
@@ -80,7 +79,7 @@ void test_storage_set_state_and_args(void)
         return;
     }
 
-    p0_expect(__LINE__, "no storage ptr", (intptr_t)co_storage(co), 0);
+    p0_expect_ptr(__LINE__, "no storage ptr", co_storage(co), NULL);
     p0_expect(__LINE__, "no storage size", co_storage_size(co), 0);
 
     p0_expect(__LINE__, "buf cap0",
@@ -95,7 +94,7 @@ void test_storage_set_state_and_args(void)
 
     p0_expect(__LINE__, "clear",
               co_set_storage(co, NULL, 0), CO_RESULT_OK);
-    p0_expect(__LINE__, "cleared ptr", (intptr_t)co_storage(co), 0);
+    p0_expect_ptr(__LINE__, "cleared ptr", co_storage(co), NULL);
     p0_expect(__LINE__, "cleared size", co_storage_size(co), 0);
 
     p0_expect(__LINE__, "resume blocks set",

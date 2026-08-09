@@ -12,12 +12,13 @@
 #include <string.h>
 
 void test_transfer_roundtrip(void);
-void test_transfer_vs_create_argument(void);
+void test_userdata_vs_initial_input(void);
 void test_mailbox_cleared_after_read(void);
 void test_storage_persist_across_yield(void);
-void test_storage_set_state_and_args(void);
+void test_storage_set_state_and_meta(void);
 
 void test_allocator_counting(void);
+void test_allocator_snapshot(void);
 void test_allocator_oom(void);
 void test_allocator_restore_default(void);
 void test_allocator_misaligned_reject(void);
@@ -42,17 +43,18 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--transfer") == 0)
             run_all = 0, run_one("mailbox", test_transfer_roundtrip);
-        if (strcmp(argv[i], "--transfer-arg") == 0 ||
-            strcmp(argv[i], "--userdata") == 0)
-            run_all = 0, run_one("userdata", test_transfer_vs_create_argument);
+        if (strcmp(argv[i], "--userdata") == 0)
+            run_all = 0, run_one("userdata", test_userdata_vs_initial_input);
         if (strcmp(argv[i], "--mailbox-clear") == 0)
             run_all = 0, run_one("mailbox-clear", test_mailbox_cleared_after_read);
         if (strcmp(argv[i], "--storage") == 0)
             run_all = 0, run_one("storage", test_storage_persist_across_yield);
         if (strcmp(argv[i], "--storage-meta") == 0)
-            run_all = 0, run_one("storage-meta", test_storage_set_state_and_args);
+            run_all = 0, run_one("storage-meta", test_storage_set_state_and_meta);
         if (strcmp(argv[i], "--allocator") == 0)
             run_all = 0, run_one("allocator", test_allocator_counting);
+        if (strcmp(argv[i], "--allocator-snapshot") == 0)
+            run_all = 0, run_one("allocator-snapshot", test_allocator_snapshot);
         if (strcmp(argv[i], "--allocator-oom") == 0)
             run_all = 0, run_one("allocator-oom", test_allocator_oom);
         if (strcmp(argv[i], "--allocator-default") == 0)
@@ -65,11 +67,12 @@ int main(int argc, char **argv)
 
     if (run_all) {
         run_one("mailbox", test_transfer_roundtrip);
-        run_one("userdata", test_transfer_vs_create_argument);
+        run_one("userdata", test_userdata_vs_initial_input);
         run_one("mailbox-clear", test_mailbox_cleared_after_read);
         run_one("storage", test_storage_persist_across_yield);
-        run_one("storage-meta", test_storage_set_state_and_args);
+        run_one("storage-meta", test_storage_set_state_and_meta);
         run_one("allocator", test_allocator_counting);
+        run_one("allocator-snapshot", test_allocator_snapshot);
         run_one("allocator-oom", test_allocator_oom);
         run_one("allocator-default", test_allocator_restore_default);
         run_one("allocator-align", test_allocator_misaligned_reject);

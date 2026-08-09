@@ -27,6 +27,8 @@ struct coroutine {
     const void       *owner_token;
     void *  storage_buffer;
     size_t  st_cap;
+    /* create 時快照；destroy 必須用同一套 alloc/free，避免中途換 g_allocator 造成 mismatch */
+    co_allocator      allocator;
 };
 
 void co_context_switch(struct co_context *from, struct co_context *to);

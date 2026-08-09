@@ -15,9 +15,6 @@ extern int g_p0_failures;
 #define P0_RESUME_IN(co, input)   co_resume((co), (input), NULL)
 #define P0_YIELD()                co_yield_now(NULL, NULL)
 
-/* 相容舊巨集名 */
-#define P0_RESUME_ARG(co, arg)    P0_RESUME_IN((co), (arg))
-
 #define p0_expect(line, name, got, want)                                      \
     do {                                                                        \
         if ((got) != (want)) {                                                  \
@@ -29,6 +26,23 @@ extern int g_p0_failures;
                      "{\"line\":%d,\"name\":\"%s\",\"got\":%d,\"want\":%d}",   \
                      (line), (name), (int)(got), (int)(want));                  \
             p0_log("FAIL", "p0_common.h:p0_expect", "assertion failed", _p0b);  \
+        }                                                                       \
+    } while (0)
+
+#define p0_expect_ptr(line, name, got, want)                                   \
+    do {                                                                        \
+        const void *_g = (const void *)(got);                                   \
+        const void *_w = (const void *)(want);                                  \
+        if (_g != _w) {                                                         \
+            fprintf(stderr, "FAIL line %d: %s got=%p want=%p\n",                \
+                    (line), (name), _g, _w);                                    \
+            g_p0_failures++;                                                    \
+            char _p0b[160];                                                     \
+            snprintf(_p0b, sizeof _p0b,                                         \
+                     "{\"line\":%d,\"name\":\"%s\",\"got\":\"%p\","            \
+                     "\"want\":\"%p\"}",                                        \
+                     (line), (name), _g, _w);                                   \
+            p0_log("FAIL", "p0_common.h:p0_expect_ptr", "ptr mismatch", _p0b);  \
         }                                                                       \
     } while (0)
 

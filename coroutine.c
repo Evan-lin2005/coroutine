@@ -160,16 +160,17 @@ static co_result co_mem_alloc(size_t n, void **out)
     return CO_RESULT_OK;
 }
 
-static void co_mem_free(void *p, size_t n)
+/* 以 create 時快照的 allocator 釋放，避免與當前 g_allocator mismatch */
+static void co_mem_free_with(const co_allocator *a, void *p, size_t n)
 {
     if (!p)
         return;
-    if (!g_allocator.alloc) {
+    if (!a || !a->alloc) {
         free(p);
         return;
     }
-    if (g_allocator.free)
-        g_allocator.free(p, n, g_allocator.userdata);
+    if (a->free)
+        a->free(p, n, a->userdata);
 }
 
 void co_set_allocator(const co_allocator *a)
@@ -239,8 +240,12 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     if (g_allocator.alloc)
         memset(co, 0, sizeof *co);
 
+    /* 快照當前 allocator；destroy 永遠用此副本，不依賴之後的 co_set_allocator */
+    co->allocator = g_allocator;
+
     if (co_stack_create(&co->stack, stack_size) != 0) {
-        co_mem_free(co, sizeof *co);
+        co_allocator snap = co->allocator;
+        co_mem_free_with(&snap, co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
     }
     co->function    = function;
@@ -360,8 +365,11 @@ co_result co_destroy(coroutine *co)
     if (co->state == CO_SUSPENDED ||
         co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
 
-    co_stack_destroy(&co->stack);
-    co_mem_free(co, sizeof *co);
+    {
+        co_allocator snap = co->allocator;
+        co_stack_destroy(&co->stack);
+        co_mem_free_with(&snap, co, sizeof *co);
+    }
     return CO_RESULT_OK;
 }
 

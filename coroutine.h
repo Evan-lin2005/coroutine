@@ -55,7 +55,7 @@ typedef struct coroutine coroutine;
  * co_current — 回傳呼叫執行緒的 TLS「目前協程」（含 main）；
  *   首次呼叫會初始化該執行緒狀態。只反映本執行緒，不能觀察其他執行緒。
  *
- * co_set_allocator — 進程級；已有活協程時更換為 UB（見 allocator 契約）。
+ * co_set_allocator — 進程級；create 時快照進協程（見 allocator 契約）。
  */
 
 /*
@@ -119,9 +119,24 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
  *   - 非 NULL 時，函式入口即寫入 *ptr = NULL；之後成功路徑再覆寫為實際訊息。
  *   - 因此任一錯誤返回後，*output / *next_input 皆為 NULL（不會殘留呼叫前舊值）。
  *
+ * Message pointer lifetime（庫只搬運 void*，不擁有指向物件）：
+ *   - ownership：傳入的 input / output 指標本體由呼叫端擁有；庫不 malloc、不 free、不深拷貝。
+ *   - 有效期：指向的物件須在收件方「讀取並用完」前保持有效。典型上：
+ *       · resume 的 input：至少活到目標協程消費後（首次為 callback 的 initial_input；
+ *         其後為對方 co_yield_now 返回的 *next_input）。
+ *       · yield 的 output：至少活到 caller 的 co_resume 返回並讀完 *output。
+ *   - 掛起期間若呼叫端已釋放訊息指向的記憶體而對方仍持有該 void* → Undefined Behavior。
+ *   - 讀後清空：mailbox 消費後即為 NULL，不可當成跨多次切換的永久狀態。
+ *
+ * Normal-return semantics（callback 正常返回）：
+ *   - co_function 返回後協程進入 CO_DONE；trampoline 將 caller->mailbox 設為 NULL。
+ *   - 因此成功的最後一次 co_resume 在目標結束時：*output == NULL（若 output 非 NULL）。
+ *   - 沒有「函式回傳值」通道；若需傳回結果，必須在返回前以 co_yield_now(output, ...) 送出，
+ *     或寫入 userdata / storage。正常結束本身不攜帶訊息。
+ *
  * co_resume(co, input, output) — 從當前協程 resume 目標 co（須為 owner thread）：
  *   - input：傳給目標的訊息（首次 resume 時作為 co_function 的 initial_input）
- *   - output：成功且目標 yield 時為其 output；目標 CO_DONE 時為 NULL。
+ *   - output：成功且目標 yield 時為其 output；目標 CO_DONE（正常返回）時為 NULL。
  *
  * co_yield_now(output, next_input) — 從當前協程 yield 回 caller：
  *   - output：傳給 caller 的訊息（出現在 caller 的 *output）
@@ -217,11 +232,17 @@ size_t     co_storage_size(coroutine *co);
  *   - userdata — 每次 alloc/free 傳入，可綁 arena / pool 上下文。
  *
  * co_set_allocator(a)：
- *   - 進程級：拷貝 *a 到庫內 g_allocator（非持有指標）；之後 create/destroy 皆用此副本。
+ *   - 進程級：拷貝 *a 到庫內 g_allocator（非持有指標）；之後新 create 用此副本。
  *   - a == NULL，或 alloc 與 free 皆 NULL：還原預設 libc（calloc / free）。
  *   - 設自訂時 alloc 必須非 NULL；free 可為 NULL（僅 alloc 的 arena 語意）。
  *   - alloc 為 NULL 但 free 非 NULL：視為無效，還原預設 libc。
- *   - 已有活協程時更換 allocator 為 Undefined Behavior；建議程式啟動、尚未 co_create 時設定。
+ *
+ * Allocator snapshot（避免 alloc/free mismatch）：
+ *   - 每條協程在 co_create_ex 成功配置控制塊時，將當時的 g_allocator 快照進物件。
+ *   - co_destroy（以及 create 失敗回滾）一律用該快照釋放，不讀當前 g_allocator。
+ *   - 因此「先 create、再 co_set_allocator 換成另一套、再 destroy」仍會用原 allocator 的 free，
+ *     不會把自訂區塊誤丟給 libc free（或反之）。
+ *   - 仍建議在尚未有活協程時設定策略；中途更換只影響之後新建立的協程。
  */
 #define CO_ALLOC_ALIGN 16u /* 跨平台最壞情況；執行期校驗用 _Alignof(struct coroutine) */
 
