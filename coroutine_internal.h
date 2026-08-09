@@ -20,8 +20,8 @@ struct coroutine {
     struct co_context context;
     struct co_stack   stack;
     co_function       function;
-    void             *argument;
-    void             *transfer;
+    void             *userdata;
+    void             *mailbox;
     struct coroutine *caller;
     enum co_state     state;
     const void       *owner_token;

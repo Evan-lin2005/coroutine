@@ -1,0 +1,41 @@
+# P1 embed-hook tests — transfer + storage
+# Usage: make -f Makefile.p1 [test|clean]
+
+CC      ?= gcc
+CFLAGS  = -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -Itests/p0 -Itests/p1
+LDFLAGS = -pthread
+
+LIB_C   = coroutine.c platform/Linux_x86/SystemV.c
+LIB_ASM = platform/Linux_x86/sysV.S
+LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
+
+P1_SRCS = tests/p0/p0_common.c tests/p1/test_p1_main.c tests/p1/test_transfer.c \
+          tests/p1/test_storage.c tests/p1/test_allocator.c
+P1_OBJS = $(P1_SRCS:.c=.o)
+
+.PHONY: all test clean libobjs
+
+all: test_p1
+
+libobjs: $(LIB_OBJ)
+
+test_p1: $(LIB_OBJ) $(P1_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P1_OBJS) $(LDFLAGS)
+
+test: test_p1
+	./test_p1
+
+tests/p1/%.o: tests/p1/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+tests/p0/%.o: tests/p0/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+platform/Linux_x86/%.o: platform/Linux_x86/%.S
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(LIB_OBJ) $(P1_OBJS) test_p1

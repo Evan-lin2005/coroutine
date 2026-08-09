@@ -24,6 +24,16 @@ typedef enum co_result {
 typedef struct coroutine coroutine;
 
 /*
+ * 資料模型（三通道分離）
+ * ----------------------------------------------------------------
+ *   userdata — 建立時綁定的固定上下文（state），生命週期同協程
+ *   mailbox  — resume/yield 的一次性訊息（message），讀取後清空
+ *   storage  — 呼叫端提供的長期記憶體區（memory）
+ *
+ * ownership：庫只搬運 void*，不負責指向物件的配置／釋放。
+ */
+
+/*
  * co_function — 協程本體回呼。
  *
  * 契約：
@@ -32,12 +42,13 @@ typedef struct coroutine coroutine;
  *   - callback 內配置的資源必須在返回前自行釋放；C 沒有解構子，
  *     而掛起中的協程不允許銷毀（co_destroy）
  *
- * 入口參數（與 co_create 的 argument 分離）：
- *   - 首次 co_resume 傳入的 arg 會經 transfer 信箱交給本回呼，作為 argument 指標。
- *   - co_create / co_create_ex 的 argument 僅存入 coroutine，不參與切換傳值；
- *     可作 userdata（例如固定上下文），勿與 resume/yield 的 arg/out 混用。
+ * 參數：
+ *   - self           — 本協程（等同協程內 co_current()）
+ *   - userdata       — co_create 綁定的固定上下文（亦可用 co_userdata）
+ *   - initial_input  — 首次 co_resume 經 mailbox 傳入的訊息；之後傳值
+ *                      只走 co_yield_now 的 next_input
  */
-typedef void (*co_function)(void *argument);
+typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input);
 
 /*
  * 平台暫存器契約：
@@ -53,10 +64,10 @@ typedef void (*co_function)(void *argument);
  * 成功回傳 coroutine *；任一失敗（參數不合法或 OOM）皆回 NULL，無法區分原因。
  * 若需明確錯誤碼（例如 CO_RESULT_OUT_OF_MEMORY），請改用 co_create_ex。
  *
- * argument：僅寫入 coroutine 內部欄位，不經 transfer 傳遞；協程入口參數由首次
- * co_resume(co, arg, ...) 的 arg 提供（見下方 transfer 契約）。
+ * userdata：寫入協程固定上下文，不經 mailbox；可用 co_userdata 讀回。
+ * 首次訊息由 co_resume(co, input, ...) 的 input 作為 initial_input。
  */
-coroutine *co_create(size_t stack_size, co_function function, void *argument);
+coroutine *co_create(size_t stack_size, co_function function, void *userdata);
 
 /*
  * co_create_ex — 建立協程並回傳 co_result。
@@ -66,33 +77,32 @@ coroutine *co_create(size_t stack_size, co_function function, void *argument);
  *     或自訂 allocator 回傳未達 _Alignof(struct coroutine) 對齊的指標
  *   CO_RESULT_OUT_OF_MEMORY    — 物件 allocator 或平台 stack 配置失敗
  *
- * argument 語意同 co_create（userdata，與 resume/yield 傳值分離）。
+ * userdata 語意同 co_create。
  */
-co_result  co_create_ex(size_t stack_size, co_function function, void *argument,
+co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
                         coroutine **out);
 
 /*
- * Transfer 契約（resume / yield 傳值，Lua 風格 void*）
+ * Mailbox 契約（resume / yield 一次性訊息）
  * ----------------------------------------------------------------
- * 每條協程有一個 transfer 收件匣。切換時：
- *   - 切出方寫入「收件人」信箱：to->transfer = data（data 即 arg）
- *   - 切回後讀「自己」信箱：got = from->transfer（對方剛寫入的值）
+ * 每條協程有一個 mailbox。切換時：
+ *   - 切出方寫入收件人：to->mailbox = outgoing
+ *   - 切回後讀自己信箱並清空：incoming = from->mailbox; from->mailbox = NULL
  *
- * co_resume(co, arg, out) — 從當前協程 resume 目標 co：
- *   - arg：傳給目標協程的值（首次 resume 時作為 co_function 的入口參數）。
- *   - out：可為 NULL；非 NULL 時，resume 返回後 *out 為目標 yield 或結束時傳回的值。
- *     若目標已 CO_DONE（正常跑完），*out 強制為 NULL（與 co_finished 一致）。
+ * co_resume(co, input, output) — 從當前協程 resume 目標 co：
+ *   - input：傳給目標的訊息（首次 resume 時作為 co_function 的 initial_input）
+ *   - output：可為 NULL；非 NULL 時，resume 返回後 *output 為目標 yield 傳回的值。
+ *     若目標已 CO_DONE（正常跑完），*output 強制為 NULL。
  *
- * co_yield_now(arg, out) — 從當前協程 yield 回 caller：
- *   - arg：傳給 caller 的值。
- *   - out：可為 NULL；非 NULL 時，yield 返回後（下次被 resume 醒來）*out 為
- *     caller 此次 resume 傳入的 arg。
+ * co_yield_now(output, next_input) — 從當前協程 yield 回 caller：
+ *   - output：傳給 caller 的訊息（出現在 caller 的 *output）
+ *   - next_input：可為 NULL；非 NULL 時，yield 返回後（下次被 resume 醒來）
+ *     *next_input 為 caller 此次 resume 的 input
  *
- * 協程內讀「對方上次傳入的值」：在 co_yield_now 返回後讀 *out，勿用 co_create 的 argument。
  * 公開 API 使用 co_yield_now 而非 co_yield，以相容 C++。
  */
-co_result  co_resume(coroutine *co, void *arg, void **out);
-co_result  co_yield_now(void *arg, void **out);
+co_result  co_resume(coroutine *co, void *input, void **output);
+co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
 int        co_finished(const coroutine *co);
 
@@ -100,14 +110,25 @@ int        co_finished(const coroutine *co);
 size_t     co_stack_peak(const coroutine *co);
 
 /*
+ * 目前執行中的協程（含主協程 TLS 槽）。首次呼叫會確保已初始化。
+ */
+coroutine *co_current(void);
+
+/*
+ * 讀取 create 時綁定的 userdata；co == NULL 時回 NULL。
+ * userdata 生命週期同協程；庫不擁有其指向的物件。
+ */
+void      *co_userdata(const coroutine *co);
+
+/*
  * Storage 契約（可選 per-coroutine buffer，呼叫端自有記憶體）
  * ----------------------------------------------------------------
- * 與 transfer（每次切換傳一個 void*）、co_create 的 argument（userdata）分離：
+ * 與 mailbox（每次切換一個 void*）、userdata（固定上下文）分離：
  *   - Storage 是綁在協程上的 byte 區，供協程內長期讀寫（跨 yield 保留內容）。
  *   - 庫只記錄 buf 指標與 cap，不 malloc、不 free、不拷貝、不解析 layout。
  *
  * 典型流程：co_create → co_set_storage(co, buf, cap) → co_resume(...)；
- * 協程內透過 co_storage(co) 取得指標（或 co_create 的 userdata 持有 co*）。
+ * 協程內透過 co_storage(self) 或 userdata 取得上下文。
  *
  * co_set_storage(co, buf, cap) — 綁定或清除 storage：
  *   - 僅允許 CO_READY（建立後、首次 co_resume 前）；跑過或掛起後回 CO_RESULT_INVALID_STATE。
@@ -134,15 +155,15 @@ size_t     co_storage_size(coroutine *co);
 /*
  * Allocator 契約（custom allocator）
  * ----------------------------------------------------------------
- * 配置對象：struct coroutine 控制塊（context、狀態、transfer 等）。
+ * 配置對象：struct coroutine 控制塊（context、狀態、mailbox 等）。
  * 不經 allocator 的資源：
  *   - 執行 stack — 預設 co_stack_create（mmap/VirtualAlloc + guard）
  *   - storage buffer — co_set_storage 由呼叫端提供
- *   - transfer / argument — 僅存 void*，指向呼叫端資料
+ *   - mailbox / userdata — 僅存 void*，指向呼叫端資料
  *   - TLS main_coroutine — 靜態，不經 heap
  *
- * 與 transfer、storage、argument 分離：
- *   - argument / storage 管「業務資料」；allocator 管「庫的執行控制塊」。
+ * 與 mailbox、storage、userdata 分離：
+ *   - userdata / storage 管「業務資料」；allocator 管「庫的執行控制塊」。
  *   - 高頻 co_create/co_destroy 時，自訂 allocator 可讓控制塊走 arena/pool，
  *     而不必讓每次 libc calloc/free。
  *
@@ -153,8 +174,8 @@ size_t     co_storage_size(coroutine *co);
  *   - alloc(size, ud) — 配置 size 位元組；成功回傳指標或 NULL。
  *     庫在 co_create_ex 傳入 sizeof(struct coroutine)；自訂 alloc 不保證清零，
  *     庫會在自訂路徑 memset。回傳指標須滿足 _Alignof(struct coroutine) 對齊
- *     （Linux x86 通常 8、Win64 為 16）；未達標回 CO_RESULT_INVALID_ARGUMENT
- *     （debug build 另 assert）。CO_ALLOC_ALIGN 為跨平台最壞情況上限承諾。
+ *     （Linux x86 通常 8、Win64 為 16）；未達標回 CO_RESULT_INVALID_ARGUMENT。
+ *     CO_ALLOC_ALIGN 為跨平台最壞情況上限承諾。
  *   - free(ptr, size, ud) — 釋放先前 alloc 回傳的 ptr；size 與 alloc 時相同。
  *     可為 NULL：arena / bump 等不逐筆回收時，co_destroy 對控制塊為 no-op。
  *   - userdata — 每次 alloc/free 傳入，可綁 arena / pool 上下文。

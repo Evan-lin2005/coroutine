@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 /* 考慮不同compiler的差異 */
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -115,7 +114,7 @@ static void ensure_initialized(void)
 
 static void *co_exchange_and_switch(struct coroutine *from,
                                     struct coroutine *to,
-                                    void *data);
+                                    void *outgoing);
 
 /* ------------------------------------------------------------------ *
  * allocator — 僅 struct coroutine；g_allocator 為 co_set_allocator 的副本
@@ -155,8 +154,6 @@ static co_result co_mem_alloc(size_t n, void **out)
     if (!co_ptr_aligned(p)) {
         if (g_allocator.free)
             g_allocator.free(p, n, g_allocator.userdata);
-        assert(co_ptr_aligned(p) &&
-               "custom allocator: pointer not aligned to _Alignof(struct coroutine)");
         return CO_RESULT_INVALID_ARGUMENT;
     }
     *out = p;
@@ -195,18 +192,22 @@ void co_trampoline_body(void)
 {
     struct coroutine *self = current_coroutine;
     struct coroutine *caller;
+    void             *initial_input;
 
     /* P0：首次進入 fiber 時 finish 來自 caller 的 start_switch 狀態 */
     co_asan_finish_on_enter(self->caller);
 
-    self->function(self->transfer);   /* C 沒有例外可攔截；契約見標頭 */
+    /* 首次 resume 的 input：消費 mailbox 後交給 callback */
+    initial_input   = self->mailbox;
+    self->mailbox   = NULL;
+    self->function(self, self->userdata, initial_input); /* 契約見標頭 */
 
     self->state       = CO_DONE;
     caller            = self->caller;
     current_coroutine = caller;
 
-    /* 結束切回 caller 前清空其信箱，避免 co_resume 讀到過期 transfer */
-    caller->transfer = NULL;
+    /* 正常結束：無 output；避免 co_resume 讀到過期 mailbox */
+    caller->mailbox = NULL;
 
     co_do_switch(&self->context, &caller->context, self, caller);
     abort();    /* 已完成的協程不該被再次進入 */
@@ -217,7 +218,7 @@ void co_bad_return(void) { abort(); }
 /* ------------------------------------------------------------------ *
  * public API
  * ------------------------------------------------------------------ */
-co_result co_create_ex(size_t stack_size, co_function function, void *argument,
+co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
                       coroutine **out)
 {
     struct coroutine *co;
@@ -243,7 +244,7 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
         return CO_RESULT_OUT_OF_MEMORY;
     }
     co->function    = function;
-    co->argument    = argument;
+    co->userdata    = userdata;
     co->state       = CO_READY;
     co->owner_token = &thread_token;
 
@@ -252,16 +253,16 @@ co_result co_create_ex(size_t stack_size, co_function function, void *argument,
     return CO_RESULT_OK;
 }
 
-coroutine *co_create(size_t stack_size, co_function function, void *argument)
+coroutine *co_create(size_t stack_size, co_function function, void *userdata)
 {
     coroutine *co = NULL;
 
-    if (co_create_ex(stack_size, function, argument, &co) != CO_RESULT_OK)
+    if (co_create_ex(stack_size, function, userdata, &co) != CO_RESULT_OK)
         return NULL;
     return co;
 }
 
-co_result co_resume(coroutine *target,void *arg,void **out)
+co_result co_resume(coroutine *target, void *input, void **output)
 {
     struct coroutine *caller;
 
@@ -281,10 +282,10 @@ co_result co_resume(coroutine *target,void *arg,void **out)
     target->state     = CO_RUNNING;
     current_coroutine = target;
 
-    void *got = co_exchange_and_switch(caller, target, arg);
+    void *got = co_exchange_and_switch(caller, target, input);
 
-    if (out)
-        *out = (target->state == CO_DONE) ? NULL : got;
+    if (output)
+        *output = (target->state == CO_DONE) ? NULL : got;
     /* target yield 或結束後，控制流恢復 */
     current_coroutine = caller;
     caller->state     = CO_RUNNING;
@@ -293,12 +294,12 @@ co_result co_resume(coroutine *target,void *arg,void **out)
     return CO_RESULT_OK;
 }
 
-co_result co_yield_now(void* arg,void **out)
+co_result co_yield_now(void *output, void **next_input)
 {
     struct coroutine *self = current_coroutine;
     struct coroutine *caller;
 
-    //確保回傳結果不產生錯誤的失敗訊號
+    /* 確保回傳結果不產生錯誤的失敗訊號 */
     ensure_initialized();
 
     if (!self)         return CO_RESULT_INVALID_STATE;
@@ -308,9 +309,9 @@ co_result co_yield_now(void* arg,void **out)
     self->state       = CO_SUSPENDED;
     current_coroutine = caller;
 
-    void *got = co_exchange_and_switch(self, caller, arg);
-    if (out)
-        *out = got;
+    void *got = co_exchange_and_switch(self, caller, output);
+    if (next_input)
+        *next_input = got;
 
     current_coroutine = self;
     self->state       = CO_RUNNING;
@@ -318,12 +319,29 @@ co_result co_yield_now(void* arg,void **out)
 }
 
 static void *co_exchange_and_switch(struct coroutine *from,
-    struct coroutine *to,
-    void *data)
+                                    struct coroutine *to,
+                                    void *outgoing)
 {
-    to->transfer = data;
+    void *incoming;
+
+    to->mailbox = outgoing;
     co_do_switch(&from->context, &to->context, from, to);
-    return from->transfer;
+    incoming      = from->mailbox;
+    from->mailbox = NULL; /* mailbox = transient message */
+    return incoming;
+}
+
+coroutine *co_current(void)
+{
+    ensure_initialized();
+    return current_coroutine;
+}
+
+void *co_userdata(const coroutine *co)
+{
+    if (!co)
+        return NULL;
+    return co->userdata;
 }
 
 co_result co_destroy(coroutine *co)
