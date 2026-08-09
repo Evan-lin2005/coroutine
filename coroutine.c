@@ -266,6 +266,9 @@ co_result co_resume(coroutine *target, void *input, void **output)
 {
     struct coroutine *caller;
 
+    if (output)
+        *output = NULL;
+
     ensure_initialized();
 
     if (!target)                               return CO_RESULT_INVALID_ARGUMENT;
@@ -296,11 +299,14 @@ co_result co_resume(coroutine *target, void *input, void **output)
 
 co_result co_yield_now(void *output, void **next_input)
 {
-    struct coroutine *self = current_coroutine;
+    struct coroutine *self;
     struct coroutine *caller;
 
-    /* 確保回傳結果不產生錯誤的失敗訊號 */
+    if (next_input)
+        *next_input = NULL;
+
     ensure_initialized();
+    self = current_coroutine;
 
     if (!self)         return CO_RESULT_INVALID_STATE;
     if (!self->caller) return CO_RESULT_NO_CALLER;

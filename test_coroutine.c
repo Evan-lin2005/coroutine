@@ -147,12 +147,36 @@ static void test_edge_errors(void)
     expect_ptr_nonnull(__LINE__, "co_current main", co_current());
     expect_ptr_null(__LINE__, "userdata null co", co_userdata(NULL));
 
+    {
+        void *stale = (void *)(uintptr_t)0xdead;
+        expect_eq(__LINE__, "resume null clears output",
+                  co_resume(NULL, NULL, &stale), CO_RESULT_INVALID_ARGUMENT);
+        expect_ptr_null(__LINE__, "output cleared on resume err", stale);
+
+        stale = (void *)(uintptr_t)0xbeef;
+        expect_eq(__LINE__, "yield no caller clears next_input",
+                  co_yield_now(NULL, &stale), CO_RESULT_NO_CALLER);
+        expect_ptr_null(__LINE__, "next_input cleared on yield err", stale);
+    }
+
     coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_yield_once, &(int){0});
     expect_ptr_nonnull(__LINE__, "edge co", co);
     expect_eq(__LINE__, "partial resume", co_resume(co, NULL, NULL), CO_RESULT_OK);
     expect_eq(__LINE__, "destroy suspended", co_destroy(co), CO_RESULT_INVALID_STATE);
     expect_eq(__LINE__, "resume suspended", co_resume(co, NULL, NULL), CO_RESULT_OK);
     expect_eq(__LINE__, "destroy after finish", co_destroy(co), CO_RESULT_OK);
+
+    {
+        int v = 0;
+        void *stale = (void *)(uintptr_t)0xcafe;
+        coroutine *done = co_create(CO_MIN_STACK_SIZE, fn_finish, &v);
+        expect_ptr_nonnull(__LINE__, "done co", done);
+        expect_eq(__LINE__, "finish once", co_resume(done, NULL, NULL), CO_RESULT_OK);
+        expect_eq(__LINE__, "resume finished clears output",
+                  co_resume(done, NULL, &stale), CO_RESULT_FINISHED);
+        expect_ptr_null(__LINE__, "output cleared on FINISHED", stale);
+        expect_eq(__LINE__, "destroy done co", co_destroy(done), CO_RESULT_OK);
+    }
 }
 
 /* --- thread tests --- */

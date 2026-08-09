@@ -34,6 +34,31 @@ typedef struct coroutine coroutine;
  */
 
 /*
+ * 執行緒契約（owner affinity）
+ * ----------------------------------------------------------------
+ * 每條協程在 co_create / co_create_ex 時綁定建立執行緒為 owner。
+ * 主協程（TLS main）亦綁定該執行緒。
+ *
+ * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
+ *   co_resume, co_destroy, co_set_storage
+ *
+ * co_yield_now — 必須在目標協程執行中呼叫（因此已在 owner thread）；
+ *   在主協程或無 caller 時回 CO_RESULT_NO_CALLER / INVALID_STATE。
+ *
+ * Query API — 不檢查 owner、不回 WRONG_THREAD：
+ *   co_finished, co_userdata, co_storage, co_storage_size, co_stack_peak
+ *   - 設計意圖：在 owner thread 讀取。
+ *   - 與任一 mutating API（或另一執行緒上的查詢／寫入）並行存取同一
+ *     coroutine * 為 data race → Undefined Behavior。
+ *   - co == NULL 時各有定義回傳值（見各函式註解）。
+ *
+ * co_current — 回傳呼叫執行緒的 TLS「目前協程」（含 main）；
+ *   首次呼叫會初始化該執行緒狀態。只反映本執行緒，不能觀察其他執行緒。
+ *
+ * co_set_allocator — 進程級；已有活協程時更換為 UB（見 allocator 契約）。
+ */
+
+/*
  * co_function — 協程本體回呼。
  *
  * 契約：
@@ -89,34 +114,45 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
  *   - 切出方寫入收件人：to->mailbox = outgoing
  *   - 切回後讀自己信箱並清空：incoming = from->mailbox; from->mailbox = NULL
  *
- * co_resume(co, input, output) — 從當前協程 resume 目標 co：
+ * Out 參數（output / next_input）：
+ *   - 可為 NULL（表示呼叫端不取回傳值）。
+ *   - 非 NULL 時，函式入口即寫入 *ptr = NULL；之後成功路徑再覆寫為實際訊息。
+ *   - 因此任一錯誤返回後，*output / *next_input 皆為 NULL（不會殘留呼叫前舊值）。
+ *
+ * co_resume(co, input, output) — 從當前協程 resume 目標 co（須為 owner thread）：
  *   - input：傳給目標的訊息（首次 resume 時作為 co_function 的 initial_input）
- *   - output：可為 NULL；非 NULL 時，resume 返回後 *output 為目標 yield 傳回的值。
- *     若目標已 CO_DONE（正常跑完），*output 強制為 NULL。
+ *   - output：成功且目標 yield 時為其 output；目標 CO_DONE 時為 NULL。
  *
  * co_yield_now(output, next_input) — 從當前協程 yield 回 caller：
  *   - output：傳給 caller 的訊息（出現在 caller 的 *output）
- *   - next_input：可為 NULL；非 NULL 時，yield 返回後（下次被 resume 醒來）
- *     *next_input 為 caller 此次 resume 的 input
+ *   - next_input：yield 返回後（下次被 resume 醒來）為 caller 此次 resume 的 input
  *
  * 公開 API 使用 co_yield_now 而非 co_yield，以相容 C++。
  */
 co_result  co_resume(coroutine *co, void *input, void **output);
 co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
+
+/*
+ * co_finished — 是否已正常跑完（CO_DONE）。
+ * co == NULL 視為 finished（回 1）。執行緒契約見上方 Query API。
+ */
 int        co_finished(const coroutine *co);
 
-/* 以 -DCO_DEBUG_STACK_USAGE 編譯，否則失效*/
+/*
+ * co_stack_peak — 以 -DCO_DEBUG_STACK_USAGE 編譯時回傳估計峰值用量，否則回 0。
+ * co == NULL 或無 stack 時回 0。執行緒契約見上方 Query API。
+ */
 size_t     co_stack_peak(const coroutine *co);
 
 /*
- * 目前執行中的協程（含主協程 TLS 槽）。首次呼叫會確保已初始化。
+ * co_current — 本執行緒目前協程（含 main TLS 槽）。見上方執行緒契約。
  */
 coroutine *co_current(void);
 
 /*
- * 讀取 create 時綁定的 userdata；co == NULL 時回 NULL。
- * userdata 生命週期同協程；庫不擁有其指向的物件。
+ * co_userdata — create 時綁定的固定上下文；co == NULL 時回 NULL。
+ * 庫不擁有其指向的物件。執行緒契約見上方 Query API。
  */
 void      *co_userdata(const coroutine *co);
 
@@ -138,9 +174,9 @@ void      *co_userdata(const coroutine *co);
  *     CO_RESULT_INVALID_ARGUMENT。
  *   - 非建立執行緒：CO_RESULT_WRONG_THREAD。
  *
- * co_storage(co) / co_storage_size(co) — 唯讀查詢：
+ * co_storage(co) / co_storage_size(co) — 唯讀查詢（Query API，見上方執行緒契約）：
  *   - 未綁定或 co==NULL：co_storage 回 NULL，co_storage_size 回 0。
- *   - 不檢查執行緒；跨 thread 讀寫 buffer 內容為 UB。
+ *   - 跨 thread 並行讀寫 buffer 內容（或與 set_storage / resume 並行）為 UB。
  *
  * 生命週期：
  *   - buf 須在協程仍可能存取 storage 期間有效（至少至 co_destroy 完成後才可釋放）。
