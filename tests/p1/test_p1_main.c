@@ -24,6 +24,16 @@ void test_allocator_restore_default(void);
 void test_allocator_misaligned_reject(void);
 void test_external_stack_destroy(void);
 
+void test_cls_allocation(void);
+void test_cls_main(void);
+void test_cls_fiber_isolation(void);
+void test_cls_nested(void);
+void test_cls_current_consistency(void);
+void test_cls_invalid_key(void);
+void test_cls_explicit_null(void);
+void test_cls_thread_isolation(void);
+void test_cls_alloc_race(void);
+
 static void run_one(const char *name, void (*fn)(void))
 {
     int before = g_p0_failures;
@@ -63,6 +73,27 @@ int main(int argc, char **argv)
             run_all = 0, run_one("allocator-align", test_allocator_misaligned_reject);
         if (strcmp(argv[i], "--ext-stack") == 0)
             run_all = 0, run_one("ext-stack", test_external_stack_destroy);
+        if (strcmp(argv[i], "--cls-alloc") == 0)
+            run_all = 0, run_one("cls-alloc", test_cls_allocation);
+        if (strcmp(argv[i], "--cls-main") == 0)
+            run_all = 0, run_one("cls-main", test_cls_main);
+        if (strcmp(argv[i], "--cls-isolation") == 0)
+            run_all = 0, run_one("cls-isolation", test_cls_fiber_isolation);
+        if (strcmp(argv[i], "--cls-nested") == 0)
+            run_all = 0, run_one("cls-nested", test_cls_nested);
+        if (strcmp(argv[i], "--cls-current") == 0)
+            run_all = 0, run_one("cls-current", test_cls_current_consistency);
+        if (strcmp(argv[i], "--cls-invalid") == 0)
+            run_all = 0, run_one("cls-invalid", test_cls_invalid_key);
+        if (strcmp(argv[i], "--cls-null") == 0)
+            run_all = 0, run_one("cls-null", test_cls_explicit_null);
+        if (strcmp(argv[i], "--cls-thread") == 0)
+            run_all = 0, run_one("cls-thread", test_cls_thread_isolation);
+        if (strcmp(argv[i], "--cls-alloc-race") == 0) {
+            run_all = 0;
+            run_one("cls-alloc-race", test_cls_alloc_race);
+            return g_p0_failures ? 1 : 0;
+        }
     }
 
     if (run_all) {
@@ -77,6 +108,14 @@ int main(int argc, char **argv)
         run_one("allocator-default", test_allocator_restore_default);
         run_one("allocator-align", test_allocator_misaligned_reject);
         run_one("ext-stack", test_external_stack_destroy);
+        run_one("cls-alloc", test_cls_allocation);
+        run_one("cls-main", test_cls_main);
+        run_one("cls-isolation", test_cls_fiber_isolation);
+        run_one("cls-nested", test_cls_nested);
+        run_one("cls-current", test_cls_current_consistency);
+        run_one("cls-invalid", test_cls_invalid_key);
+        run_one("cls-null", test_cls_explicit_null);
+        run_one("cls-thread", test_cls_thread_isolation);
     }
 
     if (g_p0_failures) {

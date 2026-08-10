@@ -187,6 +187,82 @@ void co_set_allocator(const co_allocator *a)
 }
 
 /* ------------------------------------------------------------------ *
+ * CLS — process-global key + per-coroutine value slots
+ * ------------------------------------------------------------------ */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <windows.h>
+
+static unsigned co_atomic_load_relaxed(unsigned *p)
+{
+    return (unsigned)InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+}
+
+static int co_atomic_compare_exchange_relaxed(unsigned *p,
+                                              unsigned *expected,
+                                              unsigned desired)
+{
+    LONG prev = InterlockedCompareExchange((volatile LONG *)p,
+                                           (LONG)desired,
+                                           (LONG)*expected);
+    if ((unsigned)prev == *expected)
+        return 1;
+    *expected = (unsigned)prev;
+    return 0;
+}
+#else
+static unsigned co_atomic_load_relaxed(unsigned *p)
+{
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
+static int co_atomic_compare_exchange_relaxed(unsigned *p,
+                                              unsigned *expected,
+                                              unsigned desired)
+{
+    return __atomic_compare_exchange_n(p, expected, desired, 1,
+                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+#endif
+
+static unsigned g_cls_next;
+
+co_cls_key co_cls_alloc(void)
+{
+    unsigned current;
+
+    for (;;) {
+        current = co_atomic_load_relaxed(&g_cls_next);
+        if (current >= CO_CLS_SLOTS)
+            return CO_CLS_KEY_INVALID;
+        if (co_atomic_compare_exchange_relaxed(&g_cls_next, &current, current + 1))
+            return (co_cls_key)current;
+    }
+}
+
+co_result co_cls_set(co_cls_key key, void *value)
+{
+    struct coroutine *self;
+
+    if (key < 0 || key >= CO_CLS_SLOTS)
+        return CO_RESULT_INVALID_ARGUMENT;
+
+    self = co_current();
+    self->cls[key] = value;
+    return CO_RESULT_OK;
+}
+
+void *co_cls_get(co_cls_key key)
+{
+    struct coroutine *self;
+
+    if (key < 0 || key >= CO_CLS_SLOTS)
+        return NULL;
+
+    self = co_current();
+    return self->cls[key];
+}
+
+/* ------------------------------------------------------------------ *
  * trampoline
  * ------------------------------------------------------------------ */
 void co_trampoline_body(void)

@@ -24,11 +24,12 @@ typedef enum co_result {
 typedef struct coroutine coroutine;
 
 /*
- * 資料模型（三通道分離）
+ * 資料模型（四通道分離）
  * ----------------------------------------------------------------
  *   userdata — 建立時綁定的固定上下文（state），生命週期同協程
  *   mailbox  — resume/yield 的一次性訊息（message），讀取後清空
- *   storage  — 呼叫端提供的長期記憶體區（memory）
+ *   storage  — 呼叫端提供的長期記憶體區（memory），由呼叫端管理
+ *   CLS      — process-global key、per-coroutine 的 void* 槽（runtime metadata）
  *
  * ownership：庫只搬運 void*，不負責指向物件的配置／釋放。
  */
@@ -45,8 +46,13 @@ typedef struct coroutine coroutine;
  * co_yield_now — 必須在目標協程執行中呼叫（因此已在 owner thread）；
  *   在主協程或無 caller 時回 CO_RESULT_NO_CALLER / INVALID_STATE。
  *
+ * co_cls_set — 寫入目前協程的 CLS 槽；co_cls_get — 讀取（見下方 CLS 契約）。
+ *   兩者皆操作 co_current()，不檢查 owner_token；不同 OS thread 的
+ *   current_coroutine 互不影響。
+ *
  * Query API — 不檢查 owner、不回 WRONG_THREAD：
- *   co_finished, co_userdata, co_storage, co_storage_size, co_stack_peak
+ *   co_finished, co_userdata, co_storage, co_storage_size, co_stack_peak,
+ *   co_cls_get
  *   - 設計意圖：在 owner thread 讀取。
  *   - 與任一 mutating API（或另一執行緒上的查詢／寫入）並行存取同一
  *     coroutine * 為 data race → Undefined Behavior。
@@ -161,7 +167,13 @@ int        co_finished(const coroutine *co);
 size_t     co_stack_peak(const coroutine *co);
 
 /*
- * co_current — 本執行緒目前協程（含 main TLS 槽）。見上方執行緒契約。
+ * co_current — 本執行緒目前協程（含 TLS main 槽）。
+ *
+ * 首次呼叫會初始化該執行緒的 main 協程狀態（state=CO_RUNNING）。
+ * 只反映呼叫執行緒，無法觀察其他執行緒上的協程。
+ *
+ * CLS（co_cls_get / co_cls_set）與 callback 的 self 參數皆應與
+ * co_current() 一致（在協程本體執行期間）。
  */
 coroutine *co_current(void);
 
@@ -204,13 +216,72 @@ void      *co_storage(coroutine *co);
 size_t     co_storage_size(coroutine *co);
 
 /*
+ * Coroutine Local Storage (CLS)
+ * ----------------------------------------------------------------
+ * 類似 TLS，但 value 綁定「目前正在執行的協程」，而非 OS thread。
+ * 適合 runtime / middleware（logger、tracing、scheduler metadata），
+ * 無需修改 co_create 的 userdata layout。
+ *
+ * 與 userdata（固定上下文）、mailbox（單次訊息）、storage（byte buffer）分離：
+ *   - Key  — process-global；co_cls_alloc() 配置；thread-safe
+ *   - Value — per-coroutine；每條協程（含 TLS main）擁有 CO_CLS_SLOTS 個 void*
+ *
+ * 典型流程（模組初始化期間）：
+ *   static co_cls_key k = CO_CLS_KEY_INVALID;
+ *   k = co_cls_alloc();
+ *   co_cls_set(k, ctx);          // 在 main 或 fiber 內
+ *   void *p = co_cls_get(k);
+ *
+ * CO_CLS_SLOTS — 每條協程固定槽數（目前 16）；控制塊約 +128 bytes（64-bit）。
+ *
+ * co_cls_key — 由 co_cls_alloc() 回傳的 key 型別；可與 int 互轉比較。
+ *
+ * CO_CLS_KEY_INVALID (-1) — co_cls_alloc() 用盡槽位時的回傳值。
+ *
+ * co_cls_alloc() — 配置一個 process-global CLS key。
+ *   - thread-safe；多執行緒同時呼叫不會拿到相同 key
+ *   - 成功：0 .. CO_CLS_SLOTS-1（依配置順序遞增，不保證跨 process 相同）
+ *   - 失敗：CO_CLS_KEY_INVALID（已配置 CO_CLS_SLOTS 個 key，且不可回收）
+ *   - 建議在 application / runtime / module 初始化期間配置；不提供 co_cls_free
+ *   - Key 一旦配置，process lifetime 內不重用（避免 stale pointer）
+ *
+ * co_cls_set(key, value) — 寫入 co_current()->cls[key]。
+ *   - 成功：CO_RESULT_OK
+ *   - key < 0 或 key >= CO_CLS_SLOTS：CO_RESULT_INVALID_ARGUMENT
+ *   - value 可為 NULL（表示清除槽位；與「從未設定」在 co_cls_get 上同為 NULL）
+ *   - 不檢查 owner_token；操作呼叫執行緒的 current_coroutine（含 main）
+ *   - 庫只存 void*；指向物件由呼叫端擁有；不 malloc / free / deep copy
+ *
+ * co_cls_get(key) — 讀取 co_current()->cls[key]（Query API，見上方執行緒契約）。
+ *   - key 合法：回傳槽內指標（可能為 NULL）
+ *   - key 無效（< 0 或 >= CO_CLS_SLOTS）：回 NULL
+ *   - NULL 可能表示：槽未設定、曾 co_cls_set(key, NULL)、或 key 無效
+ *     （無法僅憑回傳值區分後兩者與「未設定」— 請保存合法 key）
+ *
+ * 生命週期與切換：
+ *   - resume 進 worker 後 co_cls_get(k) 讀到 worker.cls[k]
+ *   - yield 回 main 後讀到 main.cls[k]；各協程槽位彼此獨立
+ *   - co_destroy 不釋放 cls[i] 指向的物件、不 invoke destructor
+ *   - 指向物件須在協程仍可能讀取前有效；destroy 後不可再透過該協程存取
+ */
+#define CO_CLS_SLOTS 16
+
+typedef int co_cls_key;
+
+#define CO_CLS_KEY_INVALID (-1)
+
+co_cls_key co_cls_alloc(void);
+co_result  co_cls_set(co_cls_key key, void *value);
+void      *co_cls_get(co_cls_key key);
+
+/*
  * Allocator 契約（custom allocator）
  * ----------------------------------------------------------------
  * 配置對象：struct coroutine 控制塊（context、狀態、mailbox 等）。
  * 不經 allocator 的資源：
  *   - 執行 stack — 預設 co_stack_create（mmap/VirtualAlloc + guard）
  *   - storage buffer — co_set_storage 由呼叫端提供
- *   - mailbox / userdata — 僅存 void*，指向呼叫端資料
+ *   - mailbox / userdata / CLS value — 僅存 void*，指向呼叫端資料
  *   - TLS main_coroutine — 靜態，不經 heap
  *
  * 與 mailbox、storage、userdata 分離：
