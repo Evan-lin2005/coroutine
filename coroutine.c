@@ -446,7 +446,8 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
 
     ensure_initialized();
 
-    if (!function || stack_size < CO_MIN_STACK_SIZE)
+    if (!function || stack_size < CO_MIN_STACK_SIZE ||
+        stack_size > CO_MAX_STACK_SIZE)
         return CO_RESULT_INVALID_ARGUMENT;
 
     co_result ar;

@@ -124,17 +124,22 @@ int co_platform_initialize(void)
 
 int co_stack_create(struct co_stack *s, size_t want)
 {
-    const size_t ps     = page_size();
-    const size_t usable = (want + ps - 1) & ~(ps - 1);
-    /* 上下各留一頁邊界 */
-    const size_t total  = usable + 2 * ps;
+    const size_t ps = page_size();
+    size_t usable, total;
     void *base;
-    //預留空間(不可用)
+    DWORD old;
+
+    if (want == 0 || want > SIZE_MAX - (ps - 1))
+        return -1;
+    usable = (want + ps - 1) & ~(ps - 1);
+    if (usable < CO_MIN_STACK_SIZE || usable > SIZE_MAX - 2 * ps)
+        return -1;
+    total = usable + 2 * ps;
+
+    /* 上下各留一頁邊界 */
     base = VirtualAlloc(NULL, total, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
     if (!base) return -1;
 
-    DWORD old;
-    //中間區域設為可讀寫
     if (!VirtualProtect((char *)base + ps, usable, PAGE_READWRITE, &old)) {
         VirtualFree(base, 0, MEM_RELEASE);
         return -1;

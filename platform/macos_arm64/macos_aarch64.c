@@ -177,10 +177,16 @@ int co_platform_initialize(void)
  * ------------------------------------------------------------------ */
 int co_stack_create(struct co_stack *s, size_t want)
 {
-    const size_t ps     = page_size();
-    const size_t usable = (want + ps - 1) & ~(ps - 1);
-    const size_t total  = usable + 2 * ps;
+    const size_t ps = page_size();
+    size_t usable, total;
     void *base;
+
+    if (want == 0 || want > SIZE_MAX - (ps - 1))
+        return -1;
+    usable = (want + ps - 1) & ~(ps - 1);
+    if (usable < CO_MIN_STACK_SIZE || usable > SIZE_MAX - 2 * ps)
+        return -1;
+    total = usable + 2 * ps;
 
     base = mmap(NULL, total, PROT_NONE,
                 MAP_PRIVATE | MAP_ANON, -1, 0);

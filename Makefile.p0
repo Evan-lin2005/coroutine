@@ -10,7 +10,7 @@ LIB_ASM = platform/Linux_x86/sysV.S
 LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
 
 P0_SRCS = tests/p0/p0_common.c tests/p0/test_p0_main.c tests/p0/test_regs.c \
-          tests/p0/test_guard.c tests/p0/test_lifecycle.c
+          tests/p0/test_guard.c tests/p0/test_lifecycle.c tests/p0/test_stack_bounds.c
 P0_OBJS = $(P0_SRCS:.c=.o)
 
 .PHONY: all test bench clean libobjs test-asan

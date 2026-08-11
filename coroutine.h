@@ -5,6 +5,8 @@
 
 #define CO_MIN_STACK_SIZE     ((size_t)(16u * 1024u))
 #define CO_DEFAULT_STACK_SIZE ((size_t)(64u * 1024u))
+/* 公開上界：超過 → co_create_ex 回 INVALID_ARGUMENT（禁止超大 VMA） */
+#define CO_MAX_STACK_SIZE     ((size_t)(1u << 30)) /* 1 GiB */
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,9 +116,12 @@ coroutine *co_create(size_t stack_size, co_function function, void *userdata);
  * co_create_ex — 建立協程並回傳 co_result。
  * 成功：CO_RESULT_OK，*out 指向新協程（*out 不可為 NULL）。
  * 失敗：*out 設為 NULL，並回傳
- *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、stack_size 小於 CO_MIN_STACK_SIZE、
- *     或自訂 allocator 回傳未達 _Alignof(struct coroutine) 對齊的指標
+ *   CO_RESULT_INVALID_ARGUMENT — out 為 NULL、function 為 NULL、stack_size 小於
+ *     CO_MIN_STACK_SIZE 或大於 CO_MAX_STACK_SIZE、或自訂 allocator 回傳未達
+ *     _Alignof(struct coroutine) 對齊的指標
  *   CO_RESULT_OUT_OF_MEMORY    — 物件 allocator 或平台 stack 配置失敗
+ *
+ * 任何 stack_size 要嘛成功、要嘛回錯誤碼；禁止在 co_create* 內因參數觸發 SIGSEGV。
  *
  * userdata 語意同 co_create。
  */
