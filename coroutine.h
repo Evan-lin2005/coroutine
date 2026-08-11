@@ -38,7 +38,8 @@ typedef struct coroutine coroutine;
  * 執行緒契約（owner affinity）
  * ----------------------------------------------------------------
  * 每條協程在 co_create / co_create_ex 時綁定建立執行緒為 owner。
- * 主協程（TLS main）亦綁定該執行緒。
+ * Owner 識別為 process 生命週期內唯一的單調序號（不因執行緒結束而重用；
+ * 禁止以 TLS 物件位址當 id）。主協程（TLS main）亦綁定該執行緒。
  *
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
  *   co_resume, co_destroy, co_set_storage
@@ -47,7 +48,7 @@ typedef struct coroutine coroutine;
  *   在主協程或無 caller 時回 CO_RESULT_NO_CALLER / INVALID_STATE。
  *
  * co_cls_set — 寫入目前協程的 CLS 槽；co_cls_get — 讀取（見下方 CLS 契約）。
- *   兩者皆操作 co_current()，不檢查 owner_token；不同 OS thread 的
+ *   兩者皆操作 co_current()，不檢查 owner_id；不同 OS thread 的
  *   current_coroutine 互不影響。
  *
  * Query API — 不檢查 owner、不回 WRONG_THREAD：
@@ -249,7 +250,7 @@ size_t     co_storage_size(coroutine *co);
  *   - 成功：CO_RESULT_OK
  *   - key < 0 或 key >= CO_CLS_SLOTS：CO_RESULT_INVALID_ARGUMENT
  *   - value 可為 NULL（表示清除槽位；與「從未設定」在 co_cls_get 上同為 NULL）
- *   - 不檢查 owner_token；操作呼叫執行緒的 current_coroutine（含 main）
+ *   - 不檢查 owner_id；操作呼叫執行緒的 current_coroutine（含 main）
  *   - 庫只存 void*；指向物件由呼叫端擁有；不 malloc / free / deep copy
  *
  * co_cls_get(key) — 讀取 co_current()->cls[key]（Query API，見上方執行緒契約）。

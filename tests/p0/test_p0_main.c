@@ -16,6 +16,7 @@ void test_guard_overflow(void);
 void test_nested_depth(void);
 void test_mass_lifecycle(void);
 void test_waiting_reentry(void);
+void test_owner_cross_generation(void);
 
 static void run_one(const char *name, void (*fn)(void))
 {
@@ -39,6 +40,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--nested") == 0)       run_all = 0, run_one("nested", test_nested_depth);
         if (strcmp(argv[i], "--mass") == 0)         run_all = 0, run_one("mass", test_mass_lifecycle);
         if (strcmp(argv[i], "--waiting") == 0)      run_all = 0, run_one("waiting", test_waiting_reentry);
+        if (strcmp(argv[i], "--owner-gen") == 0)    run_all = 0, run_one("owner-gen", test_owner_cross_generation);
     }
 
     if (run_all) {
@@ -46,6 +48,7 @@ int main(int argc, char **argv)
         run_one("guard", test_guard_overflow);
         run_one("nested", test_nested_depth);
         run_one("waiting", test_waiting_reentry);
+        run_one("owner-gen", test_owner_cross_generation);
         run_one("mass", test_mass_lifecycle);
     }
 

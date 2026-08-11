@@ -24,7 +24,8 @@ struct coroutine {
     void             *mailbox;
     struct coroutine *caller;
     enum co_state     state;
-    const void       *owner_token;
+    /* process 生命週期內唯一、不因執行緒結束而重用的 owner 序號（0=未綁定／已清） */
+    uint64_t          owner_id;
     void *  storage_buffer;
     size_t  st_cap;
     void   *cls[CO_CLS_SLOTS];

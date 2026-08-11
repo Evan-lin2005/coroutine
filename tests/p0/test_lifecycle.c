@@ -196,3 +196,86 @@ void test_waiting_reentry(void)
     p0_log("H4", "test_lifecycle.c:test_waiting_reentry", "waiting reentry finished",
            g_p0_failures ? "{\"ok\":false}" : "{\"ok\":true}");
 }
+
+/* ------------------------------------------------------------------ *
+ * D-1：owner 跨世代 — join 後新執行緒不得 resume 舊協程（TLS 位址可重用）
+ * ------------------------------------------------------------------ */
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+
+static coroutine *g_d1_co;
+static volatile int g_d1_step;
+
+static void fn_d1_owner(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_d1_step = 1;
+    (void)P0_YIELD();
+    g_d1_step = 2;
+}
+
+static void *d1_owner_thread(void *arg)
+{
+    (void)arg;
+    g_d1_co = co_create(CO_MIN_STACK_SIZE, fn_d1_owner, NULL);
+    if (!g_d1_co) {
+        g_p0_failures++;
+        return NULL;
+    }
+    if (P0_RESUME(g_d1_co) != CO_RESULT_OK)
+        g_p0_failures++;
+    return NULL;
+}
+
+static void *d1_reuse_thread(void *arg)
+{
+    co_result r;
+    (void)arg;
+    r = co_resume(g_d1_co, NULL, NULL);
+    p0_expect(__LINE__, "cross-generation resume", r, CO_RESULT_WRONG_THREAD);
+    p0_expect(__LINE__, "step still after first yield", g_d1_step, 1);
+    r = co_destroy(g_d1_co);
+    p0_expect(__LINE__, "cross-generation destroy", r, CO_RESULT_WRONG_THREAD);
+    return NULL;
+}
+
+void test_owner_cross_generation(void)
+{
+    pthread_t a, b;
+
+    g_d1_step = 0;
+    g_d1_co = NULL;
+
+    p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
+           "start cross-generation owner test", "{}");
+
+    if (pthread_create(&a, NULL, d1_owner_thread, NULL) != 0) {
+        g_p0_failures++;
+        return;
+    }
+    pthread_join(a, NULL);
+    if (!g_d1_co) {
+        g_p0_failures++;
+        return;
+    }
+
+    if (pthread_create(&b, NULL, d1_reuse_thread, NULL) != 0) {
+        g_p0_failures++;
+        return;
+    }
+    pthread_join(b, NULL);
+
+    /* owner 已死：此協程無法再由本執行緒合法 destroy（D-1b 另處理 orphan） */
+    p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
+           "cross-generation finished",
+           g_p0_failures ? "{\"ok\":false}" : "{\"ok\":true}");
+}
+#else
+void test_owner_cross_generation(void)
+{
+    p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
+           "skipped on non-POSIX", "{}");
+}
+#endif

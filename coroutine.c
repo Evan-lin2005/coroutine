@@ -96,19 +96,39 @@ static void co_asan_finish_on_enter(struct coroutine *from_co)
 #endif
 
 /* ------------------------------------------------------------------ *
- * thread-local 狀態
+ * thread-local 狀態 / owner 身分（單調序號，不回收）
  * ------------------------------------------------------------------ */
-static CO_THREAD_LOCAL unsigned char   thread_token;
-static CO_THREAD_LOCAL struct coroutine main_coroutine;
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <windows.h>
+static volatile LONG64 g_thread_serial;
+#else
+static unsigned long long g_thread_serial; /* accessed via __atomic_* */
+#endif
+
+static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
+static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
+
+static uint64_t co_self_thread_id(void)
+{
+    if (thread_id == 0) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        thread_id = (uint64_t)InterlockedIncrement64(&g_thread_serial);
+#else
+        thread_id = (uint64_t)__atomic_fetch_add(&g_thread_serial, 1ull,
+                                                 __ATOMIC_RELAXED) + 1ull;
+#endif
+    }
+    return thread_id;
+}
 
 static void ensure_initialized(void)
 {
     co_platform_initialize();
     if (!current_coroutine) {
-        current_coroutine          = &main_coroutine;
-        main_coroutine.state       = CO_RUNNING;
-        main_coroutine.owner_token = &thread_token;
+        current_coroutine        = &main_coroutine;
+        main_coroutine.state     = CO_RUNNING;
+        main_coroutine.owner_id  = co_self_thread_id();
     }
 }
 
@@ -324,10 +344,10 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
         co_mem_free_with(&snap, co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
     }
-    co->function    = function;
-    co->userdata    = userdata;
-    co->state       = CO_READY;
-    co->owner_token = &thread_token;
+    co->function  = function;
+    co->userdata  = userdata;
+    co->state     = CO_READY;
+    co->owner_id  = co_self_thread_id();
 
     initialize_context(co);
     *out = co;
@@ -352,8 +372,8 @@ co_result co_resume(coroutine *target, void *input, void **output)
 
     ensure_initialized();
 
-    if (!target)                               return CO_RESULT_INVALID_ARGUMENT;
-    if (target->owner_token != &thread_token)  return CO_RESULT_WRONG_THREAD;
+    if (!target)                                    return CO_RESULT_INVALID_ARGUMENT;
+    if (target->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
     if (target->state == CO_RUNNING)           return CO_RESULT_ALREADY_RUNNING;
     if (target->state == CO_DONE)              return CO_RESULT_FINISHED;
     if (target->state == CO_WAITING)           return CO_RESULT_INVALID_STATE;
@@ -433,17 +453,18 @@ void *co_userdata(const coroutine *co)
 
 co_result co_destroy(coroutine *co)
 {
-    if (!co)                                return CO_RESULT_INVALID_ARGUMENT;
-    //只有owner thread能釋放coroutine
-    if (co->owner_token != &thread_token)   return CO_RESULT_WRONG_THREAD;
-    if (co->state == CO_RUNNING)            return CO_RESULT_ALREADY_RUNNING;
+    if (!co)                                    return CO_RESULT_INVALID_ARGUMENT;
+    /* 只有 owner thread 能釋放 coroutine */
+    if (co->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (co->state == CO_RUNNING)                return CO_RESULT_ALREADY_RUNNING;
     /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
     if (co->state == CO_SUSPENDED ||
-        co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
+        co->state == CO_WAITING)                return CO_RESULT_INVALID_STATE;
 
     {
         co_allocator snap = co->allocator;
         co_stack_destroy(&co->stack);
+        co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
         co_mem_free_with(&snap, co, sizeof *co);
     }
     return CO_RESULT_OK;
@@ -473,7 +494,7 @@ size_t co_stack_peak(const coroutine *co)
 co_result co_set_storage(coroutine *co, void *buf, size_t cap)
 {
     if (!co) return CO_RESULT_INVALID_ARGUMENT;
-    if (co->owner_token != &thread_token) return CO_RESULT_WRONG_THREAD;
+    if (co->owner_id != co_self_thread_id()) return CO_RESULT_WRONG_THREAD;
     if (co->state != CO_READY) return CO_RESULT_INVALID_STATE;
     if (buf && cap == 0) return CO_RESULT_INVALID_ARGUMENT;
     if (!buf && cap > 0) return CO_RESULT_INVALID_ARGUMENT;
