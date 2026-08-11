@@ -77,6 +77,7 @@ struct guard_entry {
     _Atomic size_t  total;
 };
 static struct guard_entry g_guards[CO_MAX_TRACKED_STACKS];
+static atomic_int g_guard_full_warned;
 
 static void guard_register(const struct co_stack *s)
 {
@@ -89,11 +90,12 @@ static void guard_register(const struct co_stack *s)
             return;
         }
     }
-    /* 表滿：以 hash slot 強制登記，讓 guard page 溢位仍能辨識 */
-    {
-        size_t i = ((uintptr_t)s->base >> 12) % CO_MAX_TRACKED_STACKS;
-        atomic_store(&g_guards[i].base, s->base);
-        atomic_store(&g_guards[i].total, s->total);
+    /* 表滿：不置換既有登記；新堆疊無法診斷溢位 */
+    if (atomic_exchange(&g_guard_full_warned, 1) == 0) {
+        static const char msg[] =
+            "*** coroutine guard tracking table full; "
+            "new stacks may lack overflow diagnosis\n";
+        (void)!write(STDERR_FILENO, msg, sizeof msg - 1);
     }
 }
 
