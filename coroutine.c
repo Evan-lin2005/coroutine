@@ -327,6 +327,14 @@ void co_set_allocator(const co_allocator *a)
     g_allocator = *a;
 }
 
+void co_install_crash_handler(int enable)
+{
+    if (!enable)
+        return;
+    ensure_initialized();
+    (void)co_platform_install_crash_handler();
+}
+
 /* ------------------------------------------------------------------ *
  * CLS — process-global key + per-coroutine value slots
  * ------------------------------------------------------------------ */

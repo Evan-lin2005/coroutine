@@ -358,6 +358,23 @@ typedef struct co_allocator {
 /* NULL = 還原預設 libc；非 NULL = 拷貝 *a 為進程級物件 allocator */
 void co_set_allocator(const co_allocator *a);
 
+/*
+ * co_install_crash_handler — 可嵌入性：guard 溢位診斷為 opt-in。
+ * ----------------------------------------------------------------
+ * 預設不安裝 process 級 SIGSEGV/SIGBUS handler，也不配置／覆寫 sigaltstack
+ * （Windows：不註冊 VEH）。standalone 需要溢位診斷字串時呼叫
+ * co_install_crash_handler(1)。
+ *
+ * enable != 0：
+ *   - 以 pthread_once（或等效）安裝 handler；保存並 chain 既有 handler
+ *   - 安裝前查詢 sigaltstack：宿主已有 altstack 則不覆寫；否則配置本庫 TLS 備用堆疊
+ *   - ASan 建置下 handler 與 altstack 皆跳過（交給 ASan）
+ * enable == 0：目前為 no-op（不提供卸載）
+ *
+ * 亦可於編譯期定義 CO_INSTALL_SIGSEGV_HANDLER，使首次平台 init 自動等同 enable=1。
+ */
+void co_install_crash_handler(int enable);
+
 #ifdef __cplusplus
 }
 #endif

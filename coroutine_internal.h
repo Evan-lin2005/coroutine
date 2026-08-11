@@ -41,6 +41,8 @@ void co_trampoline_body(void);
 void co_bad_return(void);
 
 int  co_platform_initialize(void);
+/* opt-in：安裝 SIGSEGV/SIGBUS（或 Windows VEH）診斷；ASan 下為 no-op */
+int  co_platform_install_crash_handler(void);
 int  co_stack_create(struct co_stack *s, size_t want);
 int  co_stack_create_from(struct co_stack *s, void *base, size_t total);
 void co_stack_destroy(struct co_stack *s);

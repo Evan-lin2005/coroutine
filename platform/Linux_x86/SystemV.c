@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* C23/C11 版本差異 */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
@@ -46,6 +47,18 @@ _Static_assert(offsetof(struct co_context, x87cw) == 60, "sysv.S 假設 x87cw @6
 _Static_assert(sizeof(void (*)(void)) == 8, "assumes 64-bit flat function pointers");
 
 static CO_THREAD_LOCAL int altstack_ready;
+
+#if defined(__SANITIZE_ADDRESS__)
+#  define CO_ASAN_BUILD 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define CO_ASAN_BUILD 1
+#  endif
+#endif
+
+#ifndef CO_ASAN_BUILD
+#  define CO_ASAN_BUILD 0
+#endif
 
 /* ------------------------------------------------------------------ *
  * guard page 註冊表：SIGSEGV handler 用它判斷是否為協程堆疊溢位。
@@ -114,56 +127,109 @@ static size_t page_size(void)
 }
 
 /* ------------------------------------------------------------------ *
- * SIGSEGV handler + sigaltstack
- * 沒有 altstack，堆疊爆掉時 handler 無處可跑 → double fault → 靜默消失
+ * SIGSEGV handler + sigaltstack（opt-in；見 co_install_crash_handler）
  * ------------------------------------------------------------------ */
-static void co_segv_handler(int sig, siginfo_t *si, void *uctx)
+static struct sigaction g_prev_segv;
+static struct sigaction g_prev_bus;
+static pthread_once_t   g_handler_once = PTHREAD_ONCE_INIT;
+static atomic_int       g_crash_handler_wanted;
+
+static void co_chain_prev(int sig, siginfo_t *si, void *uctx,
+                          const struct sigaction *prev)
 {
-    static const char msg_ovf[] = "*** coroutine stack overflow (guard page hit)\n";
-    static const char msg_seg[] = "*** SIGSEGV outside any coroutine guard page\n";
-    (void)uctx;
-
-    /* 只能用 async-signal-safe 函式：不可 printf、不可 malloc */
-    //取得記憶體錯誤位置，確認是否是在保護區部分
-    if (addr_in_guard(si->si_addr))
-        //溢位
-        (void)!write(STDERR_FILENO, msg_ovf, sizeof msg_ovf - 1);
-    else
-        //一般錯誤
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction)
+            prev->sa_sigaction(sig, si, uctx);
+        return;
+    }
+    if (prev->sa_handler == SIG_IGN)
+        return;
+    if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_ERR) {
+        prev->sa_handler(sig);
+        return;
+    }
+    {
+        static const char msg_seg[] =
+            "*** SIGSEGV outside any coroutine guard page\n";
         (void)!write(STDERR_FILENO, msg_seg, sizeof msg_seg - 1);
-
+    }
     _exit(128 + sig);
 }
 
-//利用備用堆疊承接溢位堆疊，使co_segv_handler 能成功地執行完畢
-static void install_altstack(void)
+static void co_segv_handler(int sig, siginfo_t *si, void *uctx)
+{
+    static const char msg_ovf[] =
+        "*** coroutine stack overflow (guard page hit)\n";
+    (void)uctx;
+
+    if (addr_in_guard(si->si_addr)) {
+        (void)!write(STDERR_FILENO, msg_ovf, sizeof msg_ovf - 1);
+        _exit(128 + sig);
+    }
+
+    if (sig == SIGBUS)
+        co_chain_prev(sig, si, uctx, &g_prev_bus);
+    else
+        co_chain_prev(sig, si, uctx, &g_prev_segv);
+}
+
+static void install_altstack_for_thread(void)
 {
     static CO_THREAD_LOCAL char alt[64 * 1024];
-    stack_t ss;
-    struct sigaction sa;
+    stack_t old, ss;
 
-    //避免重複設定
-    if (altstack_ready) return;
+    if (altstack_ready)
+        return;
+    altstack_ready = 1;
 
-    //配置備用堆疊
+    if (sigaltstack(NULL, &old) == 0 && old.ss_sp &&
+        !(old.ss_flags & SS_DISABLE))
+        return; /* 宿主已有 altstack，不動它 */
+
     ss.ss_sp    = alt;
     ss.ss_flags = 0;
     ss.ss_size  = sizeof alt;
-    sigaltstack(&ss, NULL);
+    (void)sigaltstack(&ss, NULL);
+}
+
+static void install_handlers_process(void)
+{
+    struct sigaction sa;
 
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = co_segv_handler;
     sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS,  &sa, &g_prev_bus);
+}
 
-    altstack_ready = 1;
+static void co_platform_enable_crash_handler_local(void)
+{
+#if CO_ASAN_BUILD
+    return;
+#else
+    atomic_store(&g_crash_handler_wanted, 1);
+    pthread_once(&g_handler_once, install_handlers_process);
+    install_altstack_for_thread();
+#endif
+}
+
+int co_platform_install_crash_handler(void)
+{
+    co_platform_enable_crash_handler_local();
+    return 0;
 }
 
 int co_platform_initialize(void)
 {
-    install_altstack();
+#if defined(CO_INSTALL_SIGSEGV_HANDLER)
+    co_platform_enable_crash_handler_local();
+#else
+    /* 若他執行緒已 opt-in，本執行緒補上 altstack（handler 為 process 級） */
+    if (atomic_load(&g_crash_handler_wanted))
+        co_platform_enable_crash_handler_local();
+#endif
     return 0;
 }
 

@@ -25,6 +25,18 @@ _Static_assert(offsetof(struct co_context, pad)   == 78, "win64.S 假設 pad @78
 _Static_assert(offsetof(struct co_context, xmm)   == 80, "win64.S 假設 xmm @80");
 _Static_assert(sizeof(void (*)(void)) == 8, "assumes 64-bit flat function pointers");
 
+#if defined(__SANITIZE_ADDRESS__)
+#  define CO_ASAN_BUILD 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define CO_ASAN_BUILD 1
+#  endif
+#endif
+
+#ifndef CO_ASAN_BUILD
+#  define CO_ASAN_BUILD 0
+#endif
+
 #ifndef CO_MAX_TRACKED_STACKS
 #  define CO_MAX_TRACKED_STACKS 4096 //堆疊大小
 #endif
@@ -79,6 +91,13 @@ static int addr_in_guard(const void *addr)
     return 0;
 }
 
+/* ------------------------------------------------------------------ *
+ * VEH crash handler（opt-in；見 co_install_crash_handler）
+ * 無 sigaltstack；CONTINUE_SEARCH 已鏈到後續 handler
+ * ------------------------------------------------------------------ */
+static volatile LONG g_veh_once;
+static volatile LONG g_crash_handler_wanted;
+
 static LONG WINAPI co_veh(EXCEPTION_POINTERS *info){
     EXCEPTION_RECORD *er = info->ExceptionRecord;
 
@@ -103,6 +122,23 @@ static LONG WINAPI co_veh(EXCEPTION_POINTERS *info){
     return EXCEPTION_CONTINUE_SEARCH; /* 不可達 */
 }
 
+static void co_platform_enable_crash_handler_local(void)
+{
+#if CO_ASAN_BUILD
+    return;
+#else
+    InterlockedExchange(&g_crash_handler_wanted, 1);
+    if (InterlockedCompareExchange(&g_veh_once, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, co_veh);
+#endif
+}
+
+int co_platform_install_crash_handler(void)
+{
+    co_platform_enable_crash_handler_local();
+    return 0;
+}
+
 static size_t page_size(void)
 {
     static size_t ps;
@@ -116,9 +152,13 @@ static size_t page_size(void)
 
 int co_platform_initialize(void)
 {
-    static LONG once;  
-    if (InterlockedCompareExchange(&once, 1, 0) == 0)
-        AddVectoredExceptionHandler(1, co_veh);  
+#if defined(CO_INSTALL_SIGSEGV_HANDLER)
+    co_platform_enable_crash_handler_local();
+#else
+    /* 若他執行緒已 opt-in，本執行緒／init 補上 VEH 註冊 */
+    if (InterlockedCompareExchange(&g_crash_handler_wanted, 0, 0) != 0)
+        co_platform_enable_crash_handler_local();
+#endif
     return 0;
 }
 

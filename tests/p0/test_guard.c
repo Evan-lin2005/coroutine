@@ -5,8 +5,14 @@
  * Runs overflow in a forked child so the parent test suite survives.
  */
 
+#ifndef _XOPEN_SOURCE
+#  define _XOPEN_SOURCE 700
+#endif
 #ifndef _POSIX_C_SOURCE
 #  define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE
 #endif
 
 #include "p0_common.h"
@@ -36,6 +42,7 @@ static __attribute__((noinline)) void fn_stack_overflow(coroutine *self,
 
 static int run_overflow_child(void)
 {
+    co_install_crash_handler(1);
     coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_stack_overflow, NULL);
     if (!co)
         return 2;
@@ -117,5 +124,37 @@ void test_guard_overflow(void)
         fprintf(stderr, "FAIL guard: expected message in stderr:\n%s\n", buf);
         g_p0_failures++;
     }
+#endif
+}
+
+/* D-5：宿主已有 altstack 時，opt-in 不得覆寫 ss_sp */
+void test_altstack_preserve(void)
+{
+#if !defined(__linux__) && !defined(__APPLE__)
+    p0_log("D5", "test_guard.c:test_altstack_preserve", "skipped non-POSIX", "{}");
+    return;
+#else
+    static char host_alt[64 * 1024];
+    stack_t ss, after;
+
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = host_alt;
+    ss.ss_size = sizeof host_alt;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) {
+        perror("sigaltstack setup");
+        g_p0_failures++;
+        return;
+    }
+
+    co_install_crash_handler(1);
+
+    memset(&after, 0, sizeof after);
+    if (sigaltstack(NULL, &after) != 0) {
+        perror("sigaltstack query");
+        g_p0_failures++;
+        return;
+    }
+    p0_expect_ptr(__LINE__, "altstack ss_sp preserved", after.ss_sp, host_alt);
 #endif
 }

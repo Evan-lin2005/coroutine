@@ -13,6 +13,7 @@
 
 void test_regs(void);
 void test_guard_overflow(void);
+void test_altstack_preserve(void);
 void test_nested_depth(void);
 void test_mass_lifecycle(void);
 void test_waiting_reentry(void);
@@ -41,6 +42,7 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--regs") == 0)       run_all = 0, run_one("regs", test_regs);
         if (strcmp(argv[i], "--guard") == 0)        run_all = 0, run_one("guard", test_guard_overflow);
+        if (strcmp(argv[i], "--altstack") == 0)     run_all = 0, run_one("altstack", test_altstack_preserve);
         if (strcmp(argv[i], "--nested") == 0)       run_all = 0, run_one("nested", test_nested_depth);
         if (strcmp(argv[i], "--mass") == 0)         run_all = 0, run_one("mass", test_mass_lifecycle);
         if (strcmp(argv[i], "--waiting") == 0)      run_all = 0, run_one("waiting", test_waiting_reentry);
@@ -54,6 +56,7 @@ int main(int argc, char **argv)
     if (run_all) {
         run_one("regs", test_regs);
         run_one("guard", test_guard_overflow);
+        run_one("altstack", test_altstack_preserve);
         run_one("nested", test_nested_depth);
         run_one("waiting", test_waiting_reentry);
         run_one("owner-gen", test_owner_cross_generation);
