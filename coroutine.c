@@ -36,9 +36,20 @@
  * ----------------------------------------------------------------
  * 依 LLVM sanitizer 契約：start 在切換前呼叫（fake_stack 存於 from 協程），
  * finish 在目標 stack 開始執行時（trampoline）或切換返回 from 時呼叫。
- * - fake_stack_save 傳 NULL（目前不啟用 use-after-return fake stack 追蹤）。
+ * main 邊界以平台 API 在 ensure_initialized 一次取得，不依賴 finish 配對。
  */
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
+#  define CO_ASAN_FIBER 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define CO_ASAN_FIBER 1
+#  endif
+#endif
+#ifndef CO_ASAN_FIBER
+#  define CO_ASAN_FIBER 0
+#endif
+
+#if CO_ASAN_FIBER
 extern void __sanitizer_start_switch_fiber(void **fake_stack_save,
                                            const void *bottom,
                                            size_t size);
@@ -58,37 +69,43 @@ static void co_asan_start_switch(struct coroutine *from_co,
 {
     const void *bottom = NULL;
     size_t      size   = 0;
-    (void)from_co;
 
-    if (to_co && to_co->stack.lo)
-        size = co_asan_stack_bytes(&to_co->stack);
-    if (size)
-        bottom = to_co->stack.lo;
+    if (to_co) {
+        if (to_co->stack.lo == NULL) {
+            bottom = to_co->asan_stack_bottom;
+            size   = to_co->asan_stack_size;
+        } else {
+            bottom = to_co->stack.lo;
+            size   = co_asan_stack_bytes(&to_co->stack);
+        }
+    }
 
-    /* fake_stack_save=NULL：目前僅需 stack 邊界註解，不啟用 use-after-return fake stack */
-    __sanitizer_start_switch_fiber(NULL, bottom, size);
+    __sanitizer_start_switch_fiber(from_co ? &from_co->asan_fake_stack : NULL,
+                                   bottom, size);
 }
 
-static void co_asan_finish_switch(void)
+static void co_asan_finish_switch(struct coroutine *fake_stack_owner)
 {
     const void *bottom_old = NULL;
     size_t      size_old   = 0;
-    __sanitizer_finish_switch_fiber(NULL, &bottom_old, &size_old);
+    void       *fs = fake_stack_owner ? fake_stack_owner->asan_fake_stack : NULL;
+
+    __sanitizer_finish_switch_fiber(fs, &bottom_old, &size_old);
 }
 
 static void co_do_switch(struct co_context *from, struct co_context *to,
                          struct coroutine *from_co, struct coroutine *to_co)
 {
-    (void)from_co;
     co_asan_start_switch(from_co, to_co);
     co_context_switch(from, to);
-    co_asan_finish_switch();
+    /* 回到 from：還原 from 離開時保存的 fake stack */
+    co_asan_finish_switch(from_co);
 }
 
-static void co_asan_finish_on_enter(struct coroutine *from_co)
+static void co_asan_finish_on_enter(struct coroutine *caller)
 {
-    (void)from_co;
-    co_asan_finish_switch();
+    /* 首次進入 fiber：finish 使用 caller 在 start_switch 時保存的 fake stack */
+    co_asan_finish_switch(caller);
 }
 #else
 static void co_do_switch(struct co_context *from, struct co_context *to,
@@ -236,6 +253,16 @@ static void ensure_initialized(void)
         current_coroutine       = &main_coroutine;
         main_coroutine.state    = CO_RUNNING;
         main_coroutine.owner_id = co_self_thread_id();
+#if CO_ASAN_FIBER
+        {
+            const void *bottom = NULL;
+            size_t      sz     = 0;
+            if (co_platform_query_thread_stack(&bottom, &sz) == 0) {
+                main_coroutine.asan_stack_bottom = bottom;
+                main_coroutine.asan_stack_size   = sz;
+            }
+        }
+#endif
     }
 }
 

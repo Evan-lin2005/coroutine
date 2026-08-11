@@ -33,6 +33,18 @@ struct coroutine {
     co_allocator      allocator;
     /* per-thread 存活鏈（僅 heap 協程；thread exit 時 orphan reclaim 用） */
     struct coroutine *live_next;
+#ifdef __SANITIZE_ADDRESS__
+#  define CO_ASAN_FIELDS 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define CO_ASAN_FIELDS 1
+#  endif
+#endif
+#ifdef CO_ASAN_FIELDS
+    const void       *asan_stack_bottom; /* main：平台 API；fiber：可與 stack.lo 並存 */
+    size_t            asan_stack_size;
+    void             *asan_fake_stack;   /* start_switch 保存；finish_switch 還原 */
+#endif
 };
 
 void co_context_switch(struct co_context *from, struct co_context *to);
@@ -43,6 +55,8 @@ void co_bad_return(void);
 int  co_platform_initialize(void);
 /* opt-in：安裝 SIGSEGV/SIGBUS（或 Windows VEH）診斷；ASan 下為 no-op */
 int  co_platform_install_crash_handler(void);
+/* 查詢目前 OS 執行緒主堆疊邊界（ASan main fiber 用）；成功回 0 */
+int  co_platform_query_thread_stack(const void **bottom, size_t *size);
 int  co_stack_create(struct co_stack *s, size_t want);
 int  co_stack_create_from(struct co_stack *s, void *base, size_t total);
 void co_stack_destroy(struct co_stack *s);

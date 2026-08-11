@@ -24,6 +24,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__SANITIZE_ADDRESS__)
+void test_guard_overflow(void)
+{
+    fprintf(stderr,
+            "SKIP test_guard_overflow: crash handler is a no-op under ASan\n");
+    p0_log("H3", "test_guard.c:test_guard_overflow", "skipped under ASan", "{}");
+}
+#else
 static const char k_guard_msg[] = "coroutine stack overflow (guard page hit)";
 
 static __attribute__((noinline)) void fn_stack_overflow(coroutine *self,
@@ -126,6 +134,7 @@ void test_guard_overflow(void)
     }
 #endif
 }
+#endif
 
 /* D-5：宿主已有 altstack 時，opt-in 不得覆寫 ss_sp */
 void test_altstack_preserve(void)

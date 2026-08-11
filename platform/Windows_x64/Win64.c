@@ -77,6 +77,21 @@ static void guard_unregister(const struct co_stack *s)
         }
 }
 
+static size_t page_size(void)
+{
+    static size_t ps;
+    if (!ps) {
+        SYSTEM_INFO sysinfo;
+        GetSystemInfo(&sysinfo);
+        ps = (size_t)sysinfo.dwPageSize;
+    }
+    return ps;
+}
+
+#if CO_ASAN_BUILD
+int co_platform_install_crash_handler(void) { return 0; }
+int co_platform_initialize(void) { return 0; }
+#else
 //檢查記憶體地址，是否落在任何目前正受到保護的協程堆疊範圍內
 static int addr_in_guard(const void *addr)
 {
@@ -124,30 +139,15 @@ static LONG WINAPI co_veh(EXCEPTION_POINTERS *info){
 
 static void co_platform_enable_crash_handler_local(void)
 {
-#if CO_ASAN_BUILD
-    return;
-#else
     InterlockedExchange(&g_crash_handler_wanted, 1);
     if (InterlockedCompareExchange(&g_veh_once, 1, 0) == 0)
         AddVectoredExceptionHandler(1, co_veh);
-#endif
 }
 
 int co_platform_install_crash_handler(void)
 {
     co_platform_enable_crash_handler_local();
     return 0;
-}
-
-static size_t page_size(void)
-{
-    static size_t ps;
-    if (!ps) {
-        SYSTEM_INFO sysinfo;
-        GetSystemInfo(&sysinfo);
-        ps = (size_t)sysinfo.dwPageSize;
-    }
-    return ps;
 }
 
 int co_platform_initialize(void)
@@ -159,6 +159,18 @@ int co_platform_initialize(void)
     if (InterlockedCompareExchange(&g_crash_handler_wanted, 0, 0) != 0)
         co_platform_enable_crash_handler_local();
 #endif
+    return 0;
+}
+#endif
+
+int co_platform_query_thread_stack(const void **bottom, size_t *size)
+{
+    ULONG_PTR low = 0, high = 0;
+    if (!bottom || !size) return -1;
+    GetCurrentThreadStackLimits(&low, &high);
+    if (high <= low) return -1;
+    *bottom = (const void *)(uintptr_t)low;
+    *size = (size_t)(high - low);
     return 0;
 }
 

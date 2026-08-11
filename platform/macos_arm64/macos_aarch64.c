@@ -49,8 +49,6 @@ _Static_assert(offsetof(struct co_context, d)   == 104, "aarch.S 假設 d @104")
 /* 這份程式碼假設 AArch64：平坦位址、lr 為返回目標、bl 不壓 stack return address */
 _Static_assert(sizeof(void (*)(void)) == 8, "assumes 64-bit flat function pointers");
 
-static CO_THREAD_LOCAL int altstack_ready;
-
 #if defined(__SANITIZE_ADDRESS__)
 #  define CO_ASAN_BUILD 1
 #elif defined(__has_feature)
@@ -107,6 +105,23 @@ static void guard_unregister(const struct co_stack *s)
         }
 }
 
+static size_t page_size(void)
+{
+    static size_t ps;
+    //算出記憶體分頁大小
+    if (!ps) ps = (size_t)sysconf(_SC_PAGESIZE);
+    return ps;
+}
+
+#if CO_ASAN_BUILD
+int co_platform_install_crash_handler(void) { return 0; }
+int co_platform_initialize(void) { return 0; }
+#else
+/* ------------------------------------------------------------------ *
+ * SIGSEGV handler + sigaltstack（opt-in；見 co_install_crash_handler）
+ * ------------------------------------------------------------------ */
+static CO_THREAD_LOCAL int altstack_ready;
+
 //檢查記憶體地址，是否落在任何目前正受到保護的協程堆疊範圍內
 static int addr_in_guard(const void *addr)
 {
@@ -121,17 +136,6 @@ static int addr_in_guard(const void *addr)
     return 0;
 }
 
-static size_t page_size(void)
-{
-    static size_t ps;
-    //算出記憶體分頁大小
-    if (!ps) ps = (size_t)sysconf(_SC_PAGESIZE);
-    return ps;
-}
-
-/* ------------------------------------------------------------------ *
- * SIGSEGV handler + sigaltstack（opt-in；見 co_install_crash_handler）
- * ------------------------------------------------------------------ */
 static struct sigaction g_prev_segv;
 static struct sigaction g_prev_bus;
 static pthread_once_t   g_handler_once = PTHREAD_ONCE_INIT;
@@ -209,13 +213,9 @@ static void install_handlers_process(void)
 
 static void co_platform_enable_crash_handler_local(void)
 {
-#if CO_ASAN_BUILD
-    return;
-#else
     atomic_store(&g_crash_handler_wanted, 1);
     pthread_once(&g_handler_once, install_handlers_process);
     install_altstack_for_thread();
-#endif
 }
 
 int co_platform_install_crash_handler(void)
@@ -233,6 +233,21 @@ int co_platform_initialize(void)
     if (atomic_load(&g_crash_handler_wanted))
         co_platform_enable_crash_handler_local();
 #endif
+    return 0;
+}
+#endif
+
+int co_platform_query_thread_stack(const void **bottom, size_t *size)
+{
+    void *addr;
+    size_t sz;
+    if (!bottom || !size) return -1;
+    addr = pthread_get_stackaddr_np(pthread_self());
+    sz = pthread_get_stacksize_np(pthread_self());
+    if (!addr || sz == 0) return -1;
+    /* macOS stackaddr is the top (high address) */
+    *bottom = (const char *)addr - sz;
+    *size = sz;
     return 0;
 }
 

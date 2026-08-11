@@ -371,6 +371,9 @@ void co_set_allocator(const co_allocator *a);
  *   - ASan 建置下 handler 與 altstack 皆跳過（交給 ASan）
  * enable == 0：目前為 no-op（不提供卸載）
  *
+ * ASan：以 -fsanitize=address 建置時，切換會保存／還原 fake_stack，
+ * 以支援 stack use-after-return 偵測。
+ *
  * 亦可於編譯期定義 CO_INSTALL_SIGSEGV_HANDLER，使首次平台 init 自動等同 enable=1。
  */
 void co_install_crash_handler(int enable);
