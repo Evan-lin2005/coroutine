@@ -11,6 +11,16 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
 
 /* 考慮不同compiler的差異 */
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -98,8 +108,7 @@ static void co_asan_finish_on_enter(struct coroutine *from_co)
 /* ------------------------------------------------------------------ *
  * thread-local 狀態 / owner 身分（單調序號，不回收）
  * ------------------------------------------------------------------ */
-#if defined(_MSC_VER) && !defined(__clang__)
-#  include <windows.h>
+#if defined(_WIN32) && (defined(_MSC_VER) && !defined(__clang__))
 static volatile LONG64 g_thread_serial;
 #else
 static unsigned long long g_thread_serial; /* accessed via __atomic_* */
@@ -108,11 +117,12 @@ static unsigned long long g_thread_serial; /* accessed via __atomic_* */
 static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
 static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
+static CO_THREAD_LOCAL struct coroutine *g_live_head;
 
 static uint64_t co_self_thread_id(void)
 {
     if (thread_id == 0) {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_WIN32) && (defined(_MSC_VER) && !defined(__clang__))
         thread_id = (uint64_t)InterlockedIncrement64(&g_thread_serial);
 #else
         thread_id = (uint64_t)__atomic_fetch_add(&g_thread_serial, 1ull,
@@ -122,13 +132,110 @@ static uint64_t co_self_thread_id(void)
     return thread_id;
 }
 
+static void ensure_initialized(void);
+static void co_live_unlink(struct coroutine *co);
+static void co_internal_reclaim_orphan(struct coroutine *co);
+
+/* ------------------------------------------------------------------ *
+ * thread-exit 安全網：owner 結束時 reclaim 庫資源（非公開 kill 語意）
+ * ------------------------------------------------------------------ */
+static void co_orphan_reclaim_all(void)
+{
+    size_t n = 0;
+
+    while (g_live_head) {
+        co_internal_reclaim_orphan(g_live_head);
+        n++;
+    }
+    if (n > 0) {
+        fprintf(stderr,
+                "coroutine orphan: owner thread exited with %zu suspended "
+                "coroutine(s); library resources reclaimed\n",
+                n);
+    }
+}
+
+#if defined(_WIN32)
+static DWORD g_orphan_fls = FLS_OUT_OF_INDEXES;
+static LONG  g_orphan_fls_once;
+
+static void NTAPI co_orphan_fls_dtor(void *p)
+{
+    (void)p;
+    co_orphan_reclaim_all();
+}
+
+static void co_orphan_arm(void)
+{
+    if (InterlockedCompareExchange(&g_orphan_fls_once, 1, 0) == 0)
+        g_orphan_fls = FlsAlloc(co_orphan_fls_dtor);
+    if (g_orphan_fls != FLS_OUT_OF_INDEXES)
+        FlsSetValue(g_orphan_fls, (void *)(uintptr_t)1);
+}
+
+static void co_orphan_disarm(void)
+{
+    if (g_orphan_fls != FLS_OUT_OF_INDEXES)
+        FlsSetValue(g_orphan_fls, NULL);
+}
+#else
+static pthread_key_t  g_orphan_key;
+static pthread_once_t g_orphan_once = PTHREAD_ONCE_INIT;
+
+static void co_orphan_key_dtor(void *p)
+{
+    (void)p;
+    co_orphan_reclaim_all();
+}
+
+static void co_orphan_key_create(void)
+{
+    (void)pthread_key_create(&g_orphan_key, co_orphan_key_dtor);
+}
+
+static void co_orphan_arm(void)
+{
+    pthread_once(&g_orphan_once, co_orphan_key_create);
+    (void)pthread_setspecific(g_orphan_key, (void *)(uintptr_t)1);
+}
+
+static void co_orphan_disarm(void)
+{
+    pthread_once(&g_orphan_once, co_orphan_key_create);
+    (void)pthread_setspecific(g_orphan_key, NULL);
+}
+#endif
+
+static void co_live_link(struct coroutine *co)
+{
+    co->live_next = g_live_head;
+    g_live_head   = co;
+    co_orphan_arm();
+}
+
+static void co_live_unlink(struct coroutine *co)
+{
+    struct coroutine **pp = &g_live_head;
+
+    while (*pp) {
+        if (*pp == co) {
+            *pp = co->live_next;
+            co->live_next = NULL;
+            break;
+        }
+        pp = &(*pp)->live_next;
+    }
+    if (!g_live_head)
+        co_orphan_disarm();
+}
+
 static void ensure_initialized(void)
 {
     co_platform_initialize();
     if (!current_coroutine) {
-        current_coroutine        = &main_coroutine;
-        main_coroutine.state     = CO_RUNNING;
-        main_coroutine.owner_id  = co_self_thread_id();
+        current_coroutine       = &main_coroutine;
+        main_coroutine.state    = CO_RUNNING;
+        main_coroutine.owner_id = co_self_thread_id();
     }
 }
 
@@ -191,6 +298,20 @@ static void co_mem_free_with(const co_allocator *a, void *p, size_t n)
     }
     if (a->free)
         a->free(p, n, a->userdata);
+}
+
+/* 僅釋放庫資源；不 resume、不跑 callback、不經公開 co_destroy 狀態檢查 */
+static void co_internal_reclaim_orphan(struct coroutine *co)
+{
+    co_allocator snap;
+
+    if (!co)
+        return;
+    snap = co->allocator;
+    co_live_unlink(co);
+    co_stack_destroy(&co->stack);
+    co->owner_id = 0;
+    co_mem_free_with(&snap, co, sizeof *co);
 }
 
 void co_set_allocator(const co_allocator *a)
@@ -350,6 +471,7 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     co->owner_id  = co_self_thread_id();
 
     initialize_context(co);
+    co_live_link(co);
     *out = co;
     return CO_RESULT_OK;
 }
@@ -463,11 +585,39 @@ co_result co_destroy(coroutine *co)
 
     {
         co_allocator snap = co->allocator;
+        co_live_unlink(co);
         co_stack_destroy(&co->stack);
         co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
         co_mem_free_with(&snap, co, sizeof *co);
     }
     return CO_RESULT_OK;
+}
+
+co_result co_thread_shutdown(size_t *leaked_count)
+{
+    struct coroutine *co;
+    size_t            leaked = 0;
+
+    ensure_initialized();
+
+    co = g_live_head;
+    while (co) {
+        struct coroutine *next = co->live_next;
+
+        if (co->owner_id == co_self_thread_id()) {
+            if (co->state == CO_DONE || co->state == CO_READY) {
+                (void)co_destroy(co);
+            } else {
+                /* SUSPENDED / WAITING / RUNNING：契約禁止 destroy，計入 leaked */
+                leaked++;
+            }
+        }
+        co = next;
+    }
+
+    if (leaked_count)
+        *leaked_count = leaked;
+    return leaked ? CO_RESULT_INVALID_STATE : CO_RESULT_OK;
 }
 
 int co_finished(const coroutine *co)

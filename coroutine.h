@@ -44,6 +44,15 @@ typedef struct coroutine coroutine;
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
  *   co_resume, co_destroy, co_set_storage
  *
+ * 執行緒結束契約：
+ *   - Owner 結束前不得仍持有非 CO_DONE 的協程，除非已呼叫 co_thread_shutdown()
+ *     並依回傳處理（count>0 時應先 resume 至完成再結束執行緒）。
+ *   - 若違反：thread exit 時庫會 reclaim 控制塊與 mmap／VirtualAlloc 堆疊
+ *     （非「kill 協程」語意；callback 內未釋放的 C 物件視同 abort）。
+ *   - reclaim 後 coroutine* 失效（與 destroy 後 UAF 同類）。
+ *   - 公開 co_destroy(SUSPENDED/WAITING/RUNNING) 仍回 INVALID_STATE，與 orphan
+ *     reclaim 分路徑。
+ *
  * co_yield_now — 必須在目標協程執行中呼叫（因此已在 owner thread）；
  *   在主協程或無 caller 時回 CO_RESULT_NO_CALLER / INVALID_STATE。
  *
@@ -154,6 +163,23 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
 co_result  co_resume(coroutine *co, void *input, void **output);
 co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
+
+/*
+ * co_thread_shutdown — owner 執行緒結束前清理名下協程（caller 義務入口）。
+ *
+ * 掃描本執行緒存活表中 owner_id == self 的協程：
+ *   - CO_DONE / CO_READY：走正常 co_destroy
+ *   - CO_SUSPENDED / CO_WAITING / CO_RUNNING：無法合法 destroy，計入 *leaked_count
+ *
+ * 回傳：
+ *   - CO_RESULT_OK — 名下協程已全部乾淨釋放（*leaked_count == 0）
+ *   - CO_RESULT_INVALID_STATE — 仍有無法 destroy 的協程（*leaked_count > 0）；
+ *     caller 應先 resume 至完成再結束執行緒，而非直接 exit
+ *
+ * leaked_count 可為 NULL（仍回傳上述結果碼）。
+ * 不 reclaim 掛起中協程（那是 thread-exit 安全網的路徑）。
+ */
+co_result  co_thread_shutdown(size_t *leaked_count);
 
 /*
  * co_finished — 是否已正常跑完（CO_DONE）。

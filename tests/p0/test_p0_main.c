@@ -17,6 +17,9 @@ void test_nested_depth(void);
 void test_mass_lifecycle(void);
 void test_waiting_reentry(void);
 void test_owner_cross_generation(void);
+void test_orphan_shutdown_ok(void);
+void test_orphan_shutdown_warns(void);
+void test_orphan_thread_exit_reclaim(void);
 
 static void run_one(const char *name, void (*fn)(void))
 {
@@ -41,6 +44,9 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--mass") == 0)         run_all = 0, run_one("mass", test_mass_lifecycle);
         if (strcmp(argv[i], "--waiting") == 0)      run_all = 0, run_one("waiting", test_waiting_reentry);
         if (strcmp(argv[i], "--owner-gen") == 0)    run_all = 0, run_one("owner-gen", test_owner_cross_generation);
+        if (strcmp(argv[i], "--orphan-ok") == 0)    run_all = 0, run_one("orphan-ok", test_orphan_shutdown_ok);
+        if (strcmp(argv[i], "--orphan-warn") == 0)  run_all = 0, run_one("orphan-warn", test_orphan_shutdown_warns);
+        if (strcmp(argv[i], "--orphan-exit") == 0)  run_all = 0, run_one("orphan-exit", test_orphan_thread_exit_reclaim);
     }
 
     if (run_all) {
@@ -49,6 +55,9 @@ int main(int argc, char **argv)
         run_one("nested", test_nested_depth);
         run_one("waiting", test_waiting_reentry);
         run_one("owner-gen", test_owner_cross_generation);
+        run_one("orphan-ok", test_orphan_shutdown_ok);
+        run_one("orphan-warn", test_orphan_shutdown_warns);
+        run_one("orphan-exit", test_orphan_thread_exit_reclaim);
         run_one("mass", test_mass_lifecycle);
     }
 

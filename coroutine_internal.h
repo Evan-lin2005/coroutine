@@ -31,6 +31,8 @@ struct coroutine {
     void   *cls[CO_CLS_SLOTS];
     /* create 時快照；destroy 必須用同一套 alloc/free，避免中途換 g_allocator 造成 mismatch */
     co_allocator      allocator;
+    /* per-thread 存活鏈（僅 heap 協程；thread exit 時 orphan reclaim 用） */
+    struct coroutine *live_next;
 };
 
 void co_context_switch(struct co_context *from, struct co_context *to);

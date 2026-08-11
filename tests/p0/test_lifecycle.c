@@ -199,12 +199,71 @@ void test_waiting_reentry(void)
 
 /* ------------------------------------------------------------------ *
  * D-1：owner 跨世代 — join 後新執行緒不得 resume 舊協程（TLS 位址可重用）
+ * D-1b：co_thread_shutdown + thread-exit orphan reclaim
  * ------------------------------------------------------------------ */
+static void fn_orphan_yield(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+    (void)P0_YIELD();
+}
+
+void test_orphan_shutdown_ok(void)
+{
+    size_t     leaked = 99;
+    co_result  r;
+    coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_orphan_yield, NULL);
+
+    if (!co) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "resume to yield", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "resume to done", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "finished", co_finished(co), 1);
+    p0_expect(__LINE__, "destroy", co_destroy(co), CO_RESULT_OK);
+
+    r = co_thread_shutdown(&leaked);
+    p0_expect(__LINE__, "shutdown ok", r, CO_RESULT_OK);
+    p0_expect(__LINE__, "leaked count 0", (int)leaked, 0);
+}
+
+void test_orphan_shutdown_warns(void)
+{
+    size_t     leaked = 0;
+    co_result  r;
+    coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_orphan_yield, NULL);
+
+    if (!co) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "resume to suspend", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "destroy suspended", co_destroy(co),
+              CO_RESULT_INVALID_STATE);
+
+    r = co_thread_shutdown(&leaked);
+    p0_expect(__LINE__, "shutdown warns", r, CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "leaked count 1", (int)leaked, 1);
+
+    /* 清理：resume 完成後再 destroy，避免污染後續測／主執行緒 exit */
+    p0_expect(__LINE__, "resume finish", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "destroy after done", co_destroy(co), CO_RESULT_OK);
+    leaked = 99;
+    p0_expect(__LINE__, "shutdown clean", co_thread_shutdown(&leaked),
+              CO_RESULT_OK);
+    p0_expect(__LINE__, "leaked cleared", (int)leaked, 0);
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
+#include <stdint.h>
 
 static coroutine *g_d1_co;
 static volatile int g_d1_step;
+static volatile int g_d1_ready;
+static volatile int g_d1_done;
 
 static void fn_d1_owner(coroutine *self, void *ud, void *in)
 {
@@ -222,10 +281,21 @@ static void *d1_owner_thread(void *arg)
     g_d1_co = co_create(CO_MIN_STACK_SIZE, fn_d1_owner, NULL);
     if (!g_d1_co) {
         g_p0_failures++;
+        g_d1_ready = 1;
         return NULL;
     }
     if (P0_RESUME(g_d1_co) != CO_RESULT_OK)
         g_p0_failures++;
+    /* owner 仍存活：讓另一執行緒探測 WRONG_THREAD（避免 exit reclaim 造成 UAF） */
+    g_d1_ready = 1;
+    while (!g_d1_done) {
+        /* spin */
+    }
+    if (g_d1_co) {
+        (void)P0_RESUME(g_d1_co);
+        (void)co_destroy(g_d1_co);
+        g_d1_co = NULL;
+    }
     return NULL;
 }
 
@@ -233,11 +303,18 @@ static void *d1_reuse_thread(void *arg)
 {
     co_result r;
     (void)arg;
+    while (!g_d1_ready) {
+    }
+    if (!g_d1_co) {
+        g_d1_done = 1;
+        return NULL;
+    }
     r = co_resume(g_d1_co, NULL, NULL);
-    p0_expect(__LINE__, "cross-generation resume", r, CO_RESULT_WRONG_THREAD);
+    p0_expect(__LINE__, "cross-thread resume", r, CO_RESULT_WRONG_THREAD);
     p0_expect(__LINE__, "step still after first yield", g_d1_step, 1);
     r = co_destroy(g_d1_co);
-    p0_expect(__LINE__, "cross-generation destroy", r, CO_RESULT_WRONG_THREAD);
+    p0_expect(__LINE__, "cross-thread destroy", r, CO_RESULT_WRONG_THREAD);
+    g_d1_done = 1;
     return NULL;
 }
 
@@ -247,35 +324,104 @@ void test_owner_cross_generation(void)
 
     g_d1_step = 0;
     g_d1_co = NULL;
+    g_d1_ready = 0;
+    g_d1_done = 0;
 
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
-           "start cross-generation owner test", "{}");
+           "start cross-thread owner test", "{}");
 
     if (pthread_create(&a, NULL, d1_owner_thread, NULL) != 0) {
         g_p0_failures++;
         return;
     }
-    pthread_join(a, NULL);
-    if (!g_d1_co) {
-        g_p0_failures++;
-        return;
-    }
-
     if (pthread_create(&b, NULL, d1_reuse_thread, NULL) != 0) {
+        g_d1_done = 1;
+        pthread_join(a, NULL);
         g_p0_failures++;
         return;
     }
     pthread_join(b, NULL);
+    pthread_join(a, NULL);
 
-    /* owner 已死：此協程無法再由本執行緒合法 destroy（D-1b 另處理 orphan） */
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
-           "cross-generation finished",
+           "cross-thread owner finished",
            g_p0_failures ? "{\"ok\":false}" : "{\"ok\":true}");
+}
+
+static void *orphan_exit_worker(void *arg)
+{
+    coroutine *co;
+    (void)arg;
+    co = co_create(CO_MIN_STACK_SIZE, fn_orphan_yield, NULL);
+    if (!co)
+        return (void *)(intptr_t)1;
+    if (P0_RESUME(co) != CO_RESULT_OK)
+        return (void *)(intptr_t)2;
+    /* 故意不 shutdown、不 destroy：依賴 thread-exit reclaim */
+    return NULL;
+}
+
+void test_orphan_thread_exit_reclaim(void)
+{
+    enum { N = 40 };
+    long rss0, rss1, growth;
+    int i;
+    int v = 0;
+    coroutine *co;
+
+    rss0 = read_vmrss_kb();
+    for (i = 0; i < N; i++) {
+        pthread_t t;
+        void *ret = (void *)(intptr_t)-1;
+        if (pthread_create(&t, NULL, orphan_exit_worker, NULL) != 0) {
+            g_p0_failures++;
+            return;
+        }
+        pthread_join(t, &ret);
+        if (ret != NULL) {
+            fprintf(stderr, "FAIL orphan worker i=%d ret=%ld\n",
+                    i, (long)(intptr_t)ret);
+            g_p0_failures++;
+            return;
+        }
+    }
+    rss1 = read_vmrss_kb();
+    growth = (rss0 >= 0 && rss1 >= 0) ? (rss1 - rss0) : 0;
+
+    {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "{\"n\":%d,\"rss0_kb\":%ld,\"rss1_kb\":%ld,\"growth_kb\":%ld}",
+                 N, rss0, rss1, growth);
+        p0_log("D1b", "test_lifecycle.c:test_orphan_thread_exit_reclaim",
+               "rss after orphan exits", buf);
+    }
+    if (rss0 >= 0 && rss1 >= 0 && growth > (long)(N * 8)) {
+        fprintf(stderr,
+                "FAIL orphan reclaim: rss growth %ld KiB after %d exits "
+                "(suspect mmap leak)\n",
+                growth, N);
+        g_p0_failures++;
+    }
+
+    co = co_create(CO_MIN_STACK_SIZE, fn_mass, &v);
+    if (!co) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "post-reclaim resume", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "post-reclaim destroy", co_destroy(co), CO_RESULT_OK);
 }
 #else
 void test_owner_cross_generation(void)
 {
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
+           "skipped on non-POSIX", "{}");
+}
+
+void test_orphan_thread_exit_reclaim(void)
+{
+    p0_log("D1b", "test_lifecycle.c:test_orphan_thread_exit_reclaim",
            "skipped on non-POSIX", "{}");
 }
 #endif
