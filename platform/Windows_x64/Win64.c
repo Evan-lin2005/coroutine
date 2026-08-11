@@ -79,13 +79,15 @@ static void guard_unregister(const struct co_stack *s)
 
 static size_t page_size(void)
 {
-    static size_t ps;
-    if (!ps) {
+    static _Atomic size_t ps;
+    size_t v = atomic_load_explicit(&ps, memory_order_relaxed);
+    if (!v) {
         SYSTEM_INFO sysinfo;
         GetSystemInfo(&sysinfo);
-        ps = (size_t)sysinfo.dwPageSize;
+        v = (size_t)sysinfo.dwPageSize;
+        atomic_store_explicit(&ps, v, memory_order_relaxed);
     }
-    return ps;
+    return v;
 }
 
 #if CO_ASAN_BUILD

@@ -110,10 +110,13 @@ static void guard_unregister(const struct co_stack *s)
 
 static size_t page_size(void)
 {
-    static size_t ps;
-    //算出記憶體分頁大小
-    if (!ps) ps = (size_t)sysconf(_SC_PAGESIZE);
-    return ps;
+    static _Atomic size_t ps;
+    size_t v = atomic_load_explicit(&ps, memory_order_relaxed);
+    if (!v) {
+        v = (size_t)sysconf(_SC_PAGESIZE);
+        atomic_store_explicit(&ps, v, memory_order_relaxed);
+    }
+    return v;
 }
 
 #if CO_ASAN_BUILD
