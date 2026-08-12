@@ -21,6 +21,7 @@ void test_owner_cross_generation(void);
 void test_orphan_shutdown_ok(void);
 void test_orphan_shutdown_warns(void);
 void test_orphan_thread_exit_reclaim(void);
+void test_orphan_warn_count(void);
 void test_stack_bounds(void);
 
 static void run_one(const char *name, void (*fn)(void))
@@ -50,6 +51,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--orphan-ok") == 0)    run_all = 0, run_one("orphan-ok", test_orphan_shutdown_ok);
         if (strcmp(argv[i], "--orphan-warn") == 0)  run_all = 0, run_one("orphan-warn", test_orphan_shutdown_warns);
         if (strcmp(argv[i], "--orphan-exit") == 0)  run_all = 0, run_one("orphan-exit", test_orphan_thread_exit_reclaim);
+        if (strcmp(argv[i], "--orphan-count") == 0) run_all = 0, run_one("orphan-count", test_orphan_warn_count);
         if (strcmp(argv[i], "--stack-bounds") == 0) run_all = 0, run_one("stack-bounds", test_stack_bounds);
     }
 
@@ -63,6 +65,7 @@ int main(int argc, char **argv)
         run_one("orphan-ok", test_orphan_shutdown_ok);
         run_one("orphan-warn", test_orphan_shutdown_warns);
         run_one("orphan-exit", test_orphan_thread_exit_reclaim);
+        run_one("orphan-count", test_orphan_warn_count);
         run_one("stack-bounds", test_stack_bounds);
         run_one("mass", test_mass_lifecycle);
     }

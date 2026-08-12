@@ -158,17 +158,25 @@ static void co_internal_reclaim_orphan(struct coroutine *co);
  * ------------------------------------------------------------------ */
 static void co_orphan_reclaim_all(void)
 {
-    size_t n = 0;
+    /*
+     * 與 co_thread_shutdown 一致：DONE/READY 可合法銷毀，靜默回收；
+     * 僅 SUSPENDED/WAITING/RUNNING 計入警告（真正無法乾淨結束的掛起態）。
+     */
+    size_t leaked = 0;
 
     while (g_live_head) {
-        co_internal_reclaim_orphan(g_live_head);
-        n++;
+        struct coroutine *co = g_live_head;
+        enum co_state     st = co->state;
+
+        if (st != CO_DONE && st != CO_READY)
+            leaked++;
+        co_internal_reclaim_orphan(co);
     }
-    if (n > 0) {
+    if (leaked > 0) {
         fprintf(stderr,
                 "coroutine orphan: owner thread exited with %zu suspended "
                 "coroutine(s); library resources reclaimed\n",
-                n);
+                leaked);
     }
 }
 

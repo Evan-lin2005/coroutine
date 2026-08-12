@@ -5,6 +5,10 @@
  *   H5 — 10k+ short-lived coroutines create/resume/destroy without failure
  */
 
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "p0_common.h"
 
 #include <stdio.h>
@@ -30,6 +34,25 @@ static long read_vmrss_kb(void)
     }
     fclose(f);
     return kb;
+#else
+    return -1;
+#endif
+}
+
+/* mmap 洩漏反映在 VMA 條目數；不受 glibc arena／執行緒堆疊快取的固定 RSS 干擾。 */
+static long read_vma_count(void)
+{
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/maps", "r");
+    char  line[512];
+    long  n = 0;
+
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f))
+        n++;
+    fclose(f);
+    return n;
 #else
     return -1;
 #endif
@@ -259,6 +282,8 @@ void test_orphan_shutdown_warns(void)
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #include <stdint.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static coroutine *g_d1_co;
 static volatile int g_d1_step;
@@ -348,6 +373,13 @@ void test_owner_cross_generation(void)
            g_p0_failures ? "{\"ok\":false}" : "{\"ok\":true}");
 }
 
+static void fn_orphan_return(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+}
+
 static void *orphan_exit_worker(void *arg)
 {
     coroutine *co;
@@ -361,46 +393,203 @@ static void *orphan_exit_worker(void *arg)
     return NULL;
 }
 
-void test_orphan_thread_exit_reclaim(void)
+/* 1 SUSPENDED + 4 DONE + 4 READY；警告應只報 1，不是 live-list 長度 9 */
+static void *orphan_mixed_worker(void *arg)
 {
-    enum { N = 40 };
-    long rss0, rss1, growth;
     int i;
-    int v = 0;
     coroutine *co;
 
-    rss0 = read_vmrss_kb();
-    for (i = 0; i < N; i++) {
+    (void)arg;
+    co = co_create(CO_MIN_STACK_SIZE, fn_orphan_yield, NULL);
+    if (!co || P0_RESUME(co) != CO_RESULT_OK)
+        return (void *)(intptr_t)1;
+
+    for (i = 0; i < 4; i++) {
+        co = co_create(CO_MIN_STACK_SIZE, fn_orphan_return, NULL);
+        if (!co || P0_RESUME(co) != CO_RESULT_OK)
+            return (void *)(intptr_t)2;
+        /* 留在 live list：DONE，不 destroy */
+    }
+    for (i = 0; i < 4; i++) {
+        co = co_create(CO_MIN_STACK_SIZE, fn_orphan_return, NULL);
+        if (!co)
+            return (void *)(intptr_t)3;
+        /* 留在 live list：READY，不 resume／不 destroy */
+    }
+    return NULL;
+}
+
+/* 僅 DONE/READY：不應發出 orphan 警告 */
+static void *orphan_clean_leftover_worker(void *arg)
+{
+    int i;
+    coroutine *co;
+
+    (void)arg;
+    for (i = 0; i < 3; i++) {
+        co = co_create(CO_MIN_STACK_SIZE, fn_orphan_return, NULL);
+        if (!co || P0_RESUME(co) != CO_RESULT_OK)
+            return (void *)(intptr_t)1;
+    }
+    for (i = 0; i < 2; i++) {
+        co = co_create(CO_MIN_STACK_SIZE, fn_orphan_return, NULL);
+        if (!co)
+            return (void *)(intptr_t)2;
+    }
+    return NULL;
+}
+
+/* fork 子行程跑 worker，擷取 thread-exit reclaim 寫到 stderr 的訊息 */
+static int run_worker_capture_stderr(void *(*worker)(void *),
+                                     char *buf, size_t buf_sz)
+{
+    int pipefd[2];
+    pid_t pid;
+    size_t n = 0;
+    ssize_t r;
+    int status = 0;
+
+    if (pipe(pipefd) != 0)
+        return -1;
+
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
         pthread_t t;
         void *ret = (void *)(intptr_t)-1;
-        if (pthread_create(&t, NULL, orphan_exit_worker, NULL) != 0) {
-            g_p0_failures++;
-            return;
-        }
+
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+        if (pthread_create(&t, NULL, worker, NULL) != 0)
+            _exit(126);
+        pthread_join(t, &ret);
+        fflush(stderr);
+        _exit(ret == NULL ? 0 : 1);
+    }
+
+    close(pipefd[1]);
+    while (n + 1 < buf_sz &&
+           (r = read(pipefd[0], buf + n, buf_sz - 1 - n)) > 0)
+        n += (size_t)r;
+    close(pipefd[0]);
+    buf[n] = '\0';
+
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return -1;
+    return 0;
+}
+
+void test_orphan_warn_count(void)
+{
+    char buf[2048];
+
+    if (run_worker_capture_stderr(orphan_mixed_worker, buf, sizeof buf) != 0) {
+        fprintf(stderr, "FAIL orphan-warn-count: mixed worker failed\n");
+        g_p0_failures++;
+        return;
+    }
+    if (!strstr(buf, "with 1 suspended coroutine(s)")) {
+        fprintf(stderr,
+                "FAIL orphan-warn-count: expected count=1, stderr was:\n%s\n",
+                buf);
+        g_p0_failures++;
+        return;
+    }
+    if (strstr(buf, "with 9 suspended")) {
+        fprintf(stderr,
+                "FAIL orphan-warn-count: counted entire live list\n");
+        g_p0_failures++;
+        return;
+    }
+
+    if (run_worker_capture_stderr(orphan_clean_leftover_worker,
+                                  buf, sizeof buf) != 0) {
+        fprintf(stderr, "FAIL orphan-warn-count: clean worker failed\n");
+        g_p0_failures++;
+        return;
+    }
+    if (strstr(buf, "coroutine orphan:")) {
+        fprintf(stderr,
+                "FAIL orphan-warn-count: DONE/READY should be silent, got:\n%s\n",
+                buf);
+        g_p0_failures++;
+    }
+}
+
+static int run_orphan_exit_rounds(int rounds)
+{
+    int i;
+
+    for (i = 0; i < rounds; i++) {
+        pthread_t t;
+        void *ret = (void *)(intptr_t)-1;
+
+        if (pthread_create(&t, NULL, orphan_exit_worker, NULL) != 0)
+            return -1;
         pthread_join(t, &ret);
         if (ret != NULL) {
             fprintf(stderr, "FAIL orphan worker i=%d ret=%ld\n",
                     i, (long)(intptr_t)ret);
-            g_p0_failures++;
-            return;
+            return -1;
         }
     }
+    return 0;
+}
+
+void test_orphan_thread_exit_reclaim(void)
+{
+    /*
+     * 門檻用 VMA 條目數，不用 RSS：glibc 執行緒堆疊快取／arena 會造成固定
+     * ~128 KiB RSS 增長但 maps 不變；舊門檻 growth > N*8 在小 N 時會誤判。
+     * 先暖身再取基準，避免把首次 allocator 開銷算進洩漏。
+     */
+    enum { WARMUP = 8, N = 40, VMA_SLACK = 2 };
+    long vma0, vma1, vma_growth;
+    long rss0, rss1, rss_growth;
+    int v = 0;
+    coroutine *co;
+
+    if (run_orphan_exit_rounds(WARMUP) != 0) {
+        g_p0_failures++;
+        return;
+    }
+
+    vma0 = read_vma_count();
+    rss0 = read_vmrss_kb();
+    if (run_orphan_exit_rounds(N) != 0) {
+        g_p0_failures++;
+        return;
+    }
+    vma1 = read_vma_count();
     rss1 = read_vmrss_kb();
-    growth = (rss0 >= 0 && rss1 >= 0) ? (rss1 - rss0) : 0;
+    vma_growth = (vma0 >= 0 && vma1 >= 0) ? (vma1 - vma0) : 0;
+    rss_growth = (rss0 >= 0 && rss1 >= 0) ? (rss1 - rss0) : 0;
 
     {
-        char buf[128];
+        char buf[192];
         snprintf(buf, sizeof buf,
-                 "{\"n\":%d,\"rss0_kb\":%ld,\"rss1_kb\":%ld,\"growth_kb\":%ld}",
-                 N, rss0, rss1, growth);
+                 "{\"n\":%d,\"warmup\":%d,\"vma0\":%ld,\"vma1\":%ld,"
+                 "\"vma_growth\":%ld,\"rss0_kb\":%ld,\"rss1_kb\":%ld,"
+                 "\"rss_growth_kb\":%ld}",
+                 N, WARMUP, vma0, vma1, vma_growth, rss0, rss1, rss_growth);
         p0_log("D1b", "test_lifecycle.c:test_orphan_thread_exit_reclaim",
-               "rss after orphan exits", buf);
+               "vma/rss after orphan exits", buf);
     }
-    if (rss0 >= 0 && rss1 >= 0 && growth > (long)(N * 8)) {
+    /* 每個未 munmap 的協程堆疊至少 +1 VMA；允許極小雜訊。 */
+    if (vma0 >= 0 && vma1 >= 0 && vma_growth > VMA_SLACK) {
         fprintf(stderr,
-                "FAIL orphan reclaim: rss growth %ld KiB after %d exits "
-                "(suspect mmap leak)\n",
-                growth, N);
+                "FAIL orphan reclaim: VMA growth %ld after %d exits "
+                "(vma0=%ld vma1=%ld; rss_growth=%ld KiB diagnostic)\n",
+                vma_growth, N, vma0, vma1, rss_growth);
         g_p0_failures++;
     }
 
@@ -422,6 +611,12 @@ void test_owner_cross_generation(void)
 void test_orphan_thread_exit_reclaim(void)
 {
     p0_log("D1b", "test_lifecycle.c:test_orphan_thread_exit_reclaim",
+           "skipped on non-POSIX", "{}");
+}
+
+void test_orphan_warn_count(void)
+{
+    p0_log("D1b", "test_lifecycle.c:test_orphan_warn_count",
            "skipped on non-POSIX", "{}");
 }
 #endif

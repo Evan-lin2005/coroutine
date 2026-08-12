@@ -51,6 +51,8 @@ typedef struct coroutine coroutine;
  *     並依回傳處理（count>0 時應先 resume 至完成再結束執行緒）。
  *   - 若違反：thread exit 時庫會 reclaim 控制塊與 mmap／VirtualAlloc 堆疊
  *     （非「kill 協程」語意；callback 內未釋放的 C 物件視同 abort）。
+ *   - orphan 警告僅計 CO_SUSPENDED／CO_WAITING／CO_RUNNING（與
+ *     co_thread_shutdown 的 leaked_count 一致）；CO_DONE／CO_READY 靜默回收。
  *   - reclaim 後 coroutine* 失效（與 destroy 後 UAF 同類）。
  *   - 公開 co_destroy(SUSPENDED/WAITING/RUNNING) 仍回 INVALID_STATE，與 orphan
  *     reclaim 分路徑。
