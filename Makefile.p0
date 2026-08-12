@@ -41,6 +41,10 @@ bench: bench_switch
 tests/p0/test_regs.o: tests/p0/test_regs.c
 	$(CC) $(CFLAGS) -O0 -fomit-frame-pointer -c -o $@ $<
 
+# test_guard 故意遞迴撞 guard page；gcc 13+ -Werror=infinite-recursion 會擋編譯
+tests/p0/test_guard.o: tests/p0/test_guard.c
+	$(CC) $(CFLAGS) -Wno-infinite-recursion -fno-optimize-sibling-calls -c -o $@ $<
+
 tests/p0/%.o: tests/p0/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
