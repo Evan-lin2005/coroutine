@@ -217,6 +217,35 @@ static void test_wrong_thread(void)
     expect_eq(__LINE__, "owner destroy", co_destroy(x.co), CO_RESULT_OK);
 }
 
+/* --- cancel smoke test --- */
+
+typedef struct {
+    int *cleaned;
+} cancel_gen_ctx_t;
+
+static void fn_cancel_gen(coroutine *self, void *userdata, void *initial_input)
+{
+    cancel_gen_ctx_t *ctx = userdata;
+    void             *cmd = initial_input;
+
+    (void)self;
+    expect_eq(__LINE__, "gen yield", co_yield_now(NULL, &cmd), CO_RESULT_OK);
+    if (co_is_cancel(cmd))
+        *ctx->cleaned = 1;
+}
+
+static void test_cancel_generator(void)
+{
+    int cleaned = 0;
+    cancel_gen_ctx_t ctx = { &cleaned };
+    coroutine *co = co_create(CO_MIN_STACK_SIZE, fn_cancel_gen, &ctx);
+
+    expect_ptr_nonnull(__LINE__, "cancel gen create", co);
+    expect_eq(__LINE__, "gen resume", co_resume(co, NULL, NULL), CO_RESULT_OK);
+    expect_eq(__LINE__, "gen cancel", co_cancel(co), CO_RESULT_OK);
+    expect_eq(__LINE__, "gen cleaned", cleaned, 1);
+}
+
 /* --- stress / speed test --- */
 
 typedef struct {
@@ -306,6 +335,7 @@ int main(int argc, char **argv)
     test_yield_cycle();
     test_nested();
     test_edge_errors();
+    test_cancel_generator();
     test_wrong_thread();
     test_stress(getenv("CO_SPEED") ? getenv("CO_SPEED") : "custom");
 

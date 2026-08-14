@@ -11,6 +11,9 @@ todos:
   - id: p0-p1-patch-contracts
     content: D-1..D-7：owner_id／orphan shutdown、stack bounds、opt-in crash handler、ASan main bounds/fake_stack、atomic page_size、非淘汰 guard 表
     status: completed
+  - id: d9-cancel
+    content: D-9：co_cancel + CO_CANCEL sentinel、CANCEL_IGNORED
+    status: completed
   - id: p2-transfer
     content: P2：以 C 層 co_transfer 為原語，非對稱 resume/yield 建其上
     status: pending
@@ -194,6 +197,13 @@ void *co_cls_get(int key);
 - `page_size`：lazy、atomic 初始化，避免多執行緒競態。
 - 進程級共享 lazy 狀態：atomic／once，與 handler 安裝的 once 語意一致。
 
+### D-9：合作式取消（`co_cancel` + sentinel，已落地）
+
+- **問題**：`co_destroy` 僅允許 `CO_READY`／`CO_DONE`；提前放棄的 generator 卡在 `CO_SUSPENDED` 時 64 KiB 回不來。
+- **作法**：`co_cancel(co)` 以 `CO_CANCEL` mailbox sentinel resume 掛起協程；回呼在 yield 點用 `co_is_cancel` 檢查並 return；成功路徑自動 `co_destroy`。
+- **狀態**：`READY`／`DONE` 直接 destroy；`SUSPENDED` resume sentinel；`RUNNING`／`WAITING` 拒絕；違約再 yield → `CO_RESULT_CANCEL_IGNORED`（不偷偷 munmap）。
+- **維持**：`co_destroy(SUSPENDED)` 仍 `INVALID_STATE`；`co_thread_shutdown` 不自動 cancel。
+
 ---
 
 ## P2 — 對稱切換為底層原語
@@ -271,6 +281,7 @@ P2 須明確鎖定其一；路線圖預設採 **A**。
 | P0  | 測試與 bench；行為不變                                                                  |
 | P1  | `co_resume`/`co_yield_now` 帶 `void*`；`co_set_allocator`；`co_current`；CLS；可選 storage |
 | D-1..D-7 | `owner_id`、`co_thread_shutdown`、stack MAX、opt-in crash handler、ASan bounds/fake_stack |
+| D-9 | `co_cancel` / `CO_CANCEL` / `CANCEL_IGNORED` |
 | P2  | `co_transfer`；resume/yield 改為其上包裝；TSan fiber；外部 stack 公開決策                         |
 | P3  | stack pool 預設開啟；`co_create_opts` 選 share/copy                                   |
 

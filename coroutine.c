@@ -134,7 +134,7 @@ static unsigned long long g_thread_serial; /* accessed via __atomic_* */
 static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
 static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
-static CO_THREAD_LOCAL struct coroutine *g_live_head;
+static CO_THREAD_LOCAL struct coroutine *g_live_head; //thread_local's linked_list head
 
 static uint64_t co_self_thread_id(void)
 {
@@ -190,6 +190,7 @@ static void NTAPI co_orphan_fls_dtor(void *p)
     co_orphan_reclaim_all();
 }
 
+//掛上退出回呼函數
 static void co_orphan_arm(void)
 {
     if (InterlockedCompareExchange(&g_orphan_fls_once, 1, 0) == 0)
@@ -231,6 +232,7 @@ static void co_orphan_disarm(void)
 }
 #endif
 
+//掛入thread_local's linked_list
 static void co_live_link(struct coroutine *co)
 {
     co->live_next = g_live_head;
@@ -238,6 +240,7 @@ static void co_live_link(struct coroutine *co)
     co_orphan_arm();
 }
 
+//銷毀時從thread_local's linked_list中移除
 static void co_live_unlink(struct coroutine *co)
 {
     struct coroutine **pp = &g_live_head;
@@ -261,6 +264,7 @@ static void ensure_initialized(void)
         current_coroutine       = &main_coroutine;
         main_coroutine.state    = CO_RUNNING;
         main_coroutine.owner_id = co_self_thread_id();
+//掛上asan_stack_bottom和asan_stack_size，Asan需要知道主協程（main）的 OS 執行緒堆疊邊界
 #if CO_ASAN_FIBER
         {
             const void *bottom = NULL;
@@ -288,12 +292,14 @@ _Static_assert(_Alignof(struct coroutine) <= CO_ALLOC_ALIGN,
 
 enum { co_obj_align = _Alignof(struct coroutine) };
 
+//檢查指標是否對齊
 static int co_ptr_aligned(const void *p)
 {
     const uintptr_t mask = (uintptr_t)co_obj_align - 1u;
     return ((uintptr_t)p & mask) == 0;
 }
 
+//分配記憶體
 static co_result co_mem_alloc(size_t n, void **out)
 {
     void *p;
@@ -313,8 +319,8 @@ static co_result co_mem_alloc(size_t n, void **out)
     p = g_allocator.alloc(n, g_allocator.userdata);
     if (!p)
         return CO_RESULT_OUT_OF_MEMORY;
-    if (!co_ptr_aligned(p)) {
-        if (g_allocator.free)
+    if (!co_ptr_aligned(p)) {//檢查指標是否對齊
+        if (g_allocator.free)//如果分配失敗，釋放記憶體
             g_allocator.free(p, n, g_allocator.userdata);
         return CO_RESULT_INVALID_ARGUMENT;
     }
@@ -344,11 +350,13 @@ static void co_internal_reclaim_orphan(struct coroutine *co)
         return;
     snap = co->allocator;
     co_live_unlink(co);
-    co_stack_destroy(&co->stack);
+    co_stack_destroy(&co->stack);//釋放giber執行stack
     co->owner_id = 0;
-    co_mem_free_with(&snap, co, sizeof *co);
+    co_mem_free_with(&snap, co, sizeof *co);//釋放coroutine結構體
+    //不釋放呼叫端的記憶體
 }
 
+//設置allocator 
 void co_set_allocator(const co_allocator *a)
 {
     if (!a || (!a->alloc && !a->free)) {
@@ -372,7 +380,9 @@ void co_install_crash_handler(int enable)
 
 /* ------------------------------------------------------------------ *
  * CLS — process-global key + per-coroutine value slots
+ * 全域key + 每個協程的value slots，原子操作
  * ------------------------------------------------------------------ */
+
 #if defined(_MSC_VER) && !defined(__clang__)
 #  include <windows.h>
 
@@ -422,6 +432,8 @@ co_cls_key co_cls_alloc(void)
             return (co_cls_key)current;
     }
 }
+
+
 
 co_result co_cls_set(co_cls_key key, void *value)
 {
@@ -615,6 +627,52 @@ void *co_userdata(const coroutine *co)
     if (!co)
         return NULL;
     return co->userdata;
+}
+
+static const char co_cancel_sentinel;
+
+const void *const CO_CANCEL = &co_cancel_sentinel;
+
+int co_is_cancel(const void *msg)
+{
+    return msg == CO_CANCEL;
+}
+
+co_result co_cancel(coroutine *co)
+{
+    co_result r;
+
+    if (!co)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+
+    switch (co->state) {
+    case CO_READY:
+    case CO_DONE:
+        return co_destroy(co);
+    case CO_RUNNING:
+        return CO_RESULT_ALREADY_RUNNING;
+    case CO_WAITING:
+        return CO_RESULT_INVALID_STATE;
+    case CO_SUSPENDED:
+        break;
+    default:
+        return CO_RESULT_INVALID_STATE;
+    }
+
+    co->cancelling = 1;
+    r = co_resume(co, (void *)CO_CANCEL, NULL);
+    if (r != CO_RESULT_OK) {
+        co->cancelling = 0;
+        return r;
+    }
+
+    if (co->state == CO_DONE)
+        return co_destroy(co);
+
+    co->cancelling = 0;
+    return CO_RESULT_CANCEL_IGNORED;
 }
 
 co_result co_destroy(coroutine *co)

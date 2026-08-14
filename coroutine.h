@@ -20,7 +20,8 @@ typedef enum co_result {
     CO_RESULT_NO_CALLER,
     CO_RESULT_WRONG_THREAD,
     CO_RESULT_INVALID_STATE,
-    CO_RESULT_OUT_OF_MEMORY
+    CO_RESULT_OUT_OF_MEMORY,
+    CO_RESULT_CANCEL_IGNORED
 } co_result;
 
 typedef struct coroutine coroutine;
@@ -44,7 +45,7 @@ typedef struct coroutine coroutine;
  * 禁止以 TLS 物件位址當 id）。主協程（TLS main）亦綁定該執行緒。
  *
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
- *   co_resume, co_destroy, co_set_storage
+ *   co_resume, co_destroy, co_cancel, co_set_storage
  *
  * 執行緒結束契約：
  *   - Owner 結束前不得仍持有非 CO_DONE 的協程，除非已呼叫 co_thread_shutdown()
@@ -85,7 +86,7 @@ typedef struct coroutine coroutine;
  *   - callback 不可拋出 C++ 例外（本實作為 C，無法攔截）
  *   - callback 不可 longjmp 到協程外部的 jmp_buf
  *   - callback 內配置的資源必須在返回前自行釋放；C 沒有解構子，
- *     而掛起中的協程不允許銷毀（co_destroy）
+ *     而掛起中的協程不允許銷毀（co_destroy）；提前放棄請用 co_cancel
  *
  * 參數：
  *   - self           — 本協程（等同協程內 co_current()）
@@ -101,7 +102,8 @@ typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input
  * - AArch64：保存 x19–x28、fp（x29）、d8–d15。
  * - AArch64 不保存 FPCR/FPSR（非 ABI callee-saved）；跨切換後 FP 環境暫存器可能改變，屬預期行為。
  *
- * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy。
+ * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy /
+ *   co_cancel。
  */
 
 /*
@@ -172,6 +174,36 @@ co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
 
 /*
+ * 合作式取消（co_cancel + CO_CANCEL sentinel）
+ * ----------------------------------------------------------------
+ * 對齊 Python GeneratorExit / Lua coroutine.close：取消是一次特殊的 resume，
+ * 不是 kill、也不 unwind C stack。co_destroy(SUSPENDED/WAITING/RUNNING) 仍禁止。
+ *
+ * CO_CANCEL — 庫提供的 mailbox sentinel（不可為 NULL；NULL 表示「無訊息」）。
+ * co_is_cancel(msg) — msg == CO_CANCEL 時回非 0。
+ *
+ * co_cancel(co) — owner thread 合作式關閉：
+ *   - CO_READY：直接 destroy（不 resume；未啟動不跑 body）
+ *   - CO_DONE：直接 destroy（idempotent close）
+ *   - CO_SUSPENDED：resume(CO_CANCEL)；callback 守約 return → destroy → OK
+ *   - CO_RUNNING：ALREADY_RUNNING
+ *   - CO_WAITING：INVALID_STATE（非 yield 點，無法注入）
+ *   - 成功：等同 destroy，coroutine* 失效
+ *   - 違約（看到 sentinel 後再 yield）：CANCEL_IGNORED；協程仍 SUSPENDED，不 destroy
+ *
+ * 回呼契約：每個 yield 點（含 initial_input）須檢查 co_is_cancel；
+ *   看到 cancel 後可清理資源並 return，禁止再對 caller yield。
+ *   亦可 co_resume(co, CO_CANCEL, ...) 手動傳 sentinel，但只有 co_cancel
+ *   會設內部旗標並在成功時自動 destroy。
+ *
+ * co_thread_shutdown 不自動 cancel；仍有掛起協程時建議先 co_cancel 再 shutdown。
+ */
+extern const void *const CO_CANCEL;
+
+int       co_is_cancel(const void *msg);
+co_result co_cancel(coroutine *co);
+
+/*
  * co_thread_shutdown — owner 執行緒結束前清理名下協程（caller 義務入口）。
  *
  * 掃描本執行緒存活表中 owner_id == self 的協程：
@@ -181,7 +213,7 @@ co_result  co_destroy(coroutine *co);
  * 回傳：
  *   - CO_RESULT_OK — 名下協程已全部乾淨釋放（*leaked_count == 0）
  *   - CO_RESULT_INVALID_STATE — 仍有無法 destroy 的協程（*leaked_count > 0）；
- *     caller 應先 resume 至完成再結束執行緒，而非直接 exit
+ *     caller 應先 co_cancel 或 resume 至完成再結束執行緒，而非直接 exit
  *
  * leaked_count 可為 NULL（仍回傳上述結果碼）。
  * 不 reclaim 掛起中協程（那是 thread-exit 安全網的路徑）。
