@@ -638,6 +638,33 @@ int co_is_cancel(const void *msg)
     return msg == CO_CANCEL;
 }
 
+/*
+ * 第二次 co_cancel：回呼已違約，不再注入 sentinel。
+ * debug：印出協程後 abort。release：標為不可回收，交由 shutdown 計入 leaked。
+ */
+static co_result co_cancel_escalate(coroutine *co)
+{
+#ifndef NDEBUG
+    fprintf(stderr,
+            "coroutine: co_cancel ignored: co=%p function=%p state=%d "
+            "stack=[%p,%p) total=%zu userdata=%p owner=%llu\n",
+            (void *)co,
+            (void *)(uintptr_t)co->function,
+            (int)co->state,
+            co->stack.lo,
+            co->stack.hi,
+            co->stack.total,
+            co->userdata,
+            (unsigned long long)co->owner_id);
+    fflush(stderr);
+    abort();
+    return CO_RESULT_CANCEL_IGNORED;
+#else
+    (void)co;
+    return CO_RESULT_CANCEL_IGNORED;
+#endif
+}
+
 co_result co_cancel(coroutine *co)
 {
     co_result r;
@@ -661,17 +688,17 @@ co_result co_cancel(coroutine *co)
         return CO_RESULT_INVALID_STATE;
     }
 
+    if (co->cancelling)
+        return co_cancel_escalate(co);
+
     co->cancelling = 1;
     r = co_resume(co, (void *)CO_CANCEL, NULL);
-    if (r != CO_RESULT_OK) {
-        co->cancelling = 0;
+    if (r != CO_RESULT_OK)
         return r;
-    }
 
     if (co->state == CO_DONE)
         return co_destroy(co);
 
-    co->cancelling = 0;
     return CO_RESULT_CANCEL_IGNORED;
 }
 
@@ -710,7 +737,7 @@ co_result co_thread_shutdown(size_t *leaked_count)
             if (co->state == CO_DONE || co->state == CO_READY) {
                 (void)co_destroy(co);
             } else {
-                /* SUSPENDED / WAITING / RUNNING：契約禁止 destroy，計入 leaked */
+                /* SUSPENDED / WAITING / RUNNING（含 cancel-ignored）：禁止 destroy */
                 leaked++;
             }
         }

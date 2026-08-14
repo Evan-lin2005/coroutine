@@ -189,12 +189,18 @@ co_result  co_destroy(coroutine *co);
  *   - CO_RUNNING：ALREADY_RUNNING
  *   - CO_WAITING：INVALID_STATE（非 yield 點，無法注入）
  *   - 成功：等同 destroy，coroutine* 失效
- *   - 違約（看到 sentinel 後再 yield）：CANCEL_IGNORED；協程仍 SUSPENDED，不 destroy
+ *   - 違約（看到 sentinel 後再 yield）：CANCEL_IGNORED；協程仍 SUSPENDED，
+ *     內部 cancelling 旗標保留為 1，不 destroy（堆疊上可能有未釋放資源）
+ *   - 再次 co_cancel 且 cancelling 已為 1：不再注入 sentinel。
+ *     debug（未定義 NDEBUG）：向 stderr 印出協程後 abort()。
+ *     release（NDEBUG）：回 CANCEL_IGNORED，標為不可回收；
+ *     co_thread_shutdown 將其計入 leaked_count（與其他掛起協程相同）。
  *
  * 回呼契約：每個 yield 點（含 initial_input）須檢查 co_is_cancel；
  *   看到 cancel 後可清理資源並 return，禁止再對 caller yield。
- *   亦可 co_resume(co, CO_CANCEL, ...) 手動傳 sentinel，但只有 co_cancel
- *   會設內部旗標並在成功時自動 destroy。
+ *   只有一次合作機會；違約後不可再靠 co_cancel 回收堆疊。
+ *   亦可 co_resume(co, CO_CANCEL, ...) 手動傳 sentinel（不設旗標、
+ *   不自動 destroy）。只有 co_cancel 會設 cancelling，並在守約結束時 destroy。
  *
  * co_thread_shutdown 不自動 cancel；仍有掛起協程時建議先 co_cancel 再 shutdown。
  */
@@ -209,6 +215,7 @@ co_result co_cancel(coroutine *co);
  * 掃描本執行緒存活表中 owner_id == self 的協程：
  *   - CO_DONE / CO_READY：走正常 co_destroy
  *   - CO_SUSPENDED / CO_WAITING / CO_RUNNING：無法合法 destroy，計入 *leaked_count
+ *     （含 cancel-ignored：cancelling 已為 1、仍掛起的協程）
  *
  * 回傳：
  *   - CO_RESULT_OK — 名下協程已全部乾淨釋放（*leaked_count == 0）
