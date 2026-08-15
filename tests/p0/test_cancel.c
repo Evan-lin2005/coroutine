@@ -6,6 +6,13 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <string.h>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 /* ------------------------------------------------------------------ *
  * co_is_cancel
@@ -127,34 +134,32 @@ void test_cancel_ignored(void)
 }
 
 /* ------------------------------------------------------------------ *
- * Second cancel after ignore — cooperative on retry
+ * Second cancel after ignore — escalate (no second sentinel)
+ * debug：abort + 印出協程；release：CANCEL_IGNORED、不可回收、計入 leaked
  * ------------------------------------------------------------------ */
-static void fn_retry_cancel(coroutine *self, void *ud, void *in)
+#ifdef NDEBUG
+static void fn_ignore_cancel_count(coroutine *self, void *ud, void *in)
 {
     cancel_ctx_t *ctx = ud;
     void         *cmd = in;
 
     (void)self;
     p0_expect(__LINE__, "yield once", co_yield_now(NULL, &cmd), CO_RESULT_OK);
-    for (;;) {
-        if (!co_is_cancel(cmd))
-            break;
-        if (ctx->cancel_pass == 0) {
-            ctx->cancel_pass = 1;
-            p0_expect(__LINE__, "ignore yield",
-                      co_yield_now(NULL, &cmd), CO_RESULT_OK);
-            continue;
-        }
-        ctx->cleaned = 1;
+    if (!co_is_cancel(cmd)) {
+        g_p0_failures++;
         return;
     }
-    g_p0_failures++;
+    ctx->cancel_pass++;
+    p0_expect(__LINE__, "ignore yield", co_yield_now(NULL, &cmd), CO_RESULT_OK);
+    if (co_is_cancel(cmd))
+        ctx->cancel_pass++;
 }
 
 void test_cancel_retry_after_ignore(void)
 {
     cancel_ctx_t ctx = {0};
-    coroutine   *co  = co_create(CO_MIN_STACK_SIZE, fn_retry_cancel, &ctx);
+    size_t       leaked = 99;
+    coroutine   *co  = co_create(CO_MIN_STACK_SIZE, fn_ignore_cancel_count, &ctx);
 
     if (!co) {
         g_p0_failures++;
@@ -163,9 +168,105 @@ void test_cancel_retry_after_ignore(void)
     p0_expect(__LINE__, "resume to suspend", P0_RESUME(co), CO_RESULT_OK);
     p0_expect(__LINE__, "first cancel ignored",
               co_cancel(co), CO_RESULT_CANCEL_IGNORED);
-    p0_expect(__LINE__, "second cancel ok", co_cancel(co), CO_RESULT_OK);
-    p0_expect(__LINE__, "cleanup ran", ctx.cleaned, 1);
+    p0_expect(__LINE__, "one sentinel", ctx.cancel_pass, 1);
+    p0_expect(__LINE__, "second cancel ignored",
+              co_cancel(co), CO_RESULT_CANCEL_IGNORED);
+    p0_expect(__LINE__, "no second sentinel", ctx.cancel_pass, 1);
+    p0_expect(__LINE__, "destroy still blocked",
+              co_destroy(co), CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "shutdown leaked",
+              co_thread_shutdown(&leaked), CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "leaked count 1", (int)leaked, 1);
+    p0_expect(__LINE__, "resume finish", P0_RESUME(co), CO_RESULT_OK);
+    p0_expect(__LINE__, "destroy after finish", co_destroy(co), CO_RESULT_OK);
+    leaked = 99;
+    p0_expect(__LINE__, "shutdown clean", co_thread_shutdown(&leaked),
+              CO_RESULT_OK);
+    p0_expect(__LINE__, "leaked cleared", (int)leaked, 0);
 }
+#elif defined(__linux__) || defined(__APPLE__)
+static const char k_cancel_ignored_msg[] = "coroutine: co_cancel ignored:";
+
+void test_cancel_retry_after_ignore(void)
+{
+    int   pipefd[2];
+    pid_t pid;
+    char  buf[2048];
+    size_t n = 0;
+    ssize_t r;
+    int   status = 0;
+    int   aborted;
+    int   found_msg;
+
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        g_p0_failures++;
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        g_p0_failures++;
+        return;
+    }
+
+    if (pid == 0) {
+        coroutine *co;
+
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+
+        co = co_create(CO_MIN_STACK_SIZE, fn_ignore_cancel, NULL);
+        if (!co)
+            _exit(2);
+        if (P0_RESUME(co) != CO_RESULT_OK)
+            _exit(3);
+        if (co_cancel(co) != CO_RESULT_CANCEL_IGNORED)
+            _exit(4);
+        (void)co_cancel(co); /* debug：應 abort */
+        _exit(5);
+    }
+
+    close(pipefd[1]);
+    while (n + 1 < sizeof buf &&
+           (r = read(pipefd[0], buf + n, sizeof buf - 1 - n)) > 0)
+        n += (size_t)r;
+    close(pipefd[0]);
+    buf[n] = '\0';
+
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        g_p0_failures++;
+        return;
+    }
+
+    aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+              (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGABRT);
+    found_msg = strstr(buf, k_cancel_ignored_msg) != NULL;
+
+    if (!aborted) {
+        fprintf(stderr,
+                "FAIL cancel-retry: child did not abort (status=%d)\n",
+                status);
+        g_p0_failures++;
+    }
+    if (!found_msg) {
+        fprintf(stderr,
+                "FAIL cancel-retry: expected coroutine dump in stderr:\n%s\n",
+                buf);
+        g_p0_failures++;
+    }
+}
+#else
+void test_cancel_retry_after_ignore(void)
+{
+    p0_log("SKIP", "test_cancel.c:test_cancel_retry_after_ignore",
+           "debug abort test skipped (no fork)", "{}");
+}
+#endif
 
 /* ------------------------------------------------------------------ *
  * RUNNING — cancel self inside callback
