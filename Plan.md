@@ -201,7 +201,8 @@ void *co_cls_get(int key);
 
 - **問題**：`co_destroy` 僅允許 `CO_READY`／`CO_DONE`；提前放棄的 generator 卡在 `CO_SUSPENDED` 時 64 KiB 回不來。
 - **作法**：`co_cancel(co)` 以 `CO_CANCEL` mailbox sentinel resume 掛起協程；回呼在 yield 點用 `co_is_cancel` 檢查並 return；成功路徑自動 `co_destroy`。
-- **狀態**：`READY`／`DONE` 直接 destroy；`SUSPENDED` resume sentinel；`RUNNING`／`WAITING` 拒絕；違約再 yield → `CO_RESULT_CANCEL_IGNORED`（不偷偷 munmap）。
+- **狀態**：`READY`／`DONE` 直接 destroy；`SUSPENDED` resume sentinel；`RUNNING`／`WAITING` 拒絕；違約再 yield → `CO_RESULT_CANCEL_IGNORED`（不偷偷 munmap）。`cancelling` 跨呼叫保留。
+- **違約終局**：第二次 `co_cancel` 見旗標已為 1 則升級——不再注入 sentinel。debug 印出協程後 `abort()`；release 回 `CANCEL_IGNORED`、標為不可回收，由 `co_thread_shutdown` 計入 leaked。守約回呼仍可一次 cancel 回收；不守約的第三方回呼不能靠重試 sentinel 拿回堆疊。
 - **維持**：`co_destroy(SUSPENDED)` 仍 `INVALID_STATE`；`co_thread_shutdown` 不自動 cancel。
 
 ---

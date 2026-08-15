@@ -19,7 +19,7 @@
 
 ## 功能摘要
 
-- **合作式取消**：`co_cancel` / `CO_CANCEL` sentinel（對齊 Python `GeneratorExit`）；違約 yield → `CANCEL_IGNORED`
+- **合作式取消**：`co_cancel` / `CO_CANCEL` sentinel（對齊 Python `GeneratorExit`）；違約 yield → `CANCEL_IGNORED`（`cancelling` 保留）。再次 `co_cancel`：debug 印出協程後 abort；release 標為不可回收，計入 `co_thread_shutdown` leaked_count
 - **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)`
 - **CLS**：`co_cls_alloc` / `co_cls_set` / `co_cls_get`（process-global key、per-coroutine value）
 - **可選 storage**：`co_set_storage` / `co_storage`（呼叫端自有 buffer）
