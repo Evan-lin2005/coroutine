@@ -638,30 +638,29 @@ int co_is_cancel(const void *msg)
     return msg == CO_CANCEL;
 }
 
-/*
- * 第二次 co_cancel：回呼已違約，不再注入 sentinel。
- * debug：印出協程後 abort。release：標為不可回收，交由 shutdown 計入 leaked。
- */
-static co_result co_cancel_escalate(coroutine *co)
+int co_cancel_requested(const coroutine *co)
 {
-#ifndef NDEBUG
+    return co && co->cancelling;
+}
+
+#ifndef CO_DIAG_CANCEL
+#  define CO_DIAG_CANCEL 0
+#endif
+
+static void co_diag_cancel(const coroutine *co, int injected)
+{
+#if CO_DIAG_CANCEL
     fprintf(stderr,
-            "coroutine: co_cancel ignored: co=%p function=%p state=%d "
+            "coroutine: cancel ignored (%s): co=%p function=%p state=%d "
             "stack=[%p,%p) total=%zu userdata=%p owner=%llu\n",
-            (void *)co,
-            (void *)(uintptr_t)co->function,
-            (int)co->state,
-            co->stack.lo,
-            co->stack.hi,
-            co->stack.total,
-            co->userdata,
-            (unsigned long long)co->owner_id);
+            injected ? "callback yielded after sentinel"
+                     : "already requested, not re-injected",
+            (const void *)co, (void *)(uintptr_t)co->function, (int)co->state,
+            co->stack.lo, co->stack.hi, co->stack.total,
+            co->userdata, (unsigned long long)co->owner_id);
     fflush(stderr);
-    abort();
-    return CO_RESULT_CANCEL_IGNORED;
 #else
-    (void)co;
-    return CO_RESULT_CANCEL_IGNORED;
+    (void)co; (void)injected;
 #endif
 }
 
@@ -676,8 +675,11 @@ co_result co_cancel(coroutine *co)
 
     switch (co->state) {
     case CO_READY:
+        co->cancelling = 1;
+        co->state = CO_DONE;
+        return CO_RESULT_CANCEL_NOT_STARTED;
     case CO_DONE:
-        return co_destroy(co);
+        return CO_RESULT_OK;
     case CO_RUNNING:
         return CO_RESULT_ALREADY_RUNNING;
     case CO_WAITING:
@@ -688,17 +690,18 @@ co_result co_cancel(coroutine *co)
         return CO_RESULT_INVALID_STATE;
     }
 
-    if (co->cancelling)
-        return co_cancel_escalate(co);
+    if (co->cancelling) {
+        co_diag_cancel(co, /*injected=*/0);
+        return CO_RESULT_CANCEL_IGNORED;
+    }
 
     co->cancelling = 1;
     r = co_resume(co, (void *)CO_CANCEL, NULL);
     if (r != CO_RESULT_OK)
         return r;
-
     if (co->state == CO_DONE)
-        return co_destroy(co);
-
+        return CO_RESULT_OK;
+    co_diag_cancel(co, /*injected=*/1);
     return CO_RESULT_CANCEL_IGNORED;
 }
 

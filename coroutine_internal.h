@@ -24,7 +24,7 @@ struct coroutine {
     void             *mailbox;
     struct coroutine *caller;
     enum co_state     state;
-    int               cancelling; /* 已 co_cancel 過；違約後保留，第二次 co_cancel 升級 */
+    int               cancelling; /* 已 co_cancel；供 co_cancel_requested；第二次 co_cancel 不再注入 */
     /* process 生命週期內唯一、不因執行緒結束而重用的 owner 序號（0=未綁定／已清） */
     uint64_t          owner_id;
     void *  storage_buffer;

@@ -19,7 +19,7 @@
 
 ## 功能摘要
 
-- **合作式取消**：`co_cancel` / `CO_CANCEL` sentinel（對齊 Python `GeneratorExit`）；違約 yield → `CANCEL_IGNORED`（`cancelling` 保留）。再次 `co_cancel`：debug 印出協程後 abort；release 標為不可回收，計入 `co_thread_shutdown` leaked_count
+- **合作式取消**：`co_cancel` 只把協程推到 `CO_DONE`（READY 回 `CANCEL_NOT_STARTED`），回收一律 `co_destroy`。違約 yield → `CANCEL_IGNORED`；再次 `co_cancel` 不注入 sentinel。查詢用 `co_cancel_requested`
 - **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)`
 - **CLS**：`co_cls_alloc` / `co_cls_set` / `co_cls_get`（process-global key、per-coroutine value）
 - **可選 storage**：`co_set_storage` / `co_storage`（呼叫端自有 buffer）
@@ -93,8 +93,9 @@ co_result  co_create_ex(size_t stack_size, co_function fn, void *userdata, corou
 co_result  co_resume(coroutine *co, void *input, void **output);
 co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
-co_result  co_cancel(coroutine *co);              /* 成功則等同 destroy */
+co_result  co_cancel(coroutine *co);              /* 不釋放；成功則已 CO_DONE */
 int        co_is_cancel(const void *msg);
+int        co_cancel_requested(const coroutine *co);
 extern const void *const CO_CANCEL;
 co_result  co_thread_shutdown(size_t *leaked_count);
 void       co_install_crash_handler(int enable);
@@ -131,7 +132,7 @@ int main(void)
 ### 使用限制
 
 - callback **不可**拋出 C++ 例外，也不可 `longjmp` 出協程
-- 掛起中不可 `co_destroy`（`SUSPENDED`/`WAITING`/`RUNNING` → `INVALID_STATE`）；提前放棄請用 `co_cancel`（回呼須在 yield 點檢查 `co_is_cancel`）
+- 掛起中不可 `co_destroy`（`SUSPENDED`/`WAITING`/`RUNNING` → `INVALID_STATE`）；提前放棄請 `co_cancel` 再到 `co_destroy`（回呼須在 yield 點檢查 `co_is_cancel`）
 - 不可跨執行緒 `co_resume` / `co_destroy` / `co_cancel` / `co_set_storage`（`owner_id` 親和）
 - Owner 結束前應呼叫 `co_thread_shutdown`；仍有掛起協程時建議先 `co_cancel`；否則 thread-exit 會 reclaim 庫資源，但 callback 內未釋放的物件視同 abort
 - Guard 溢位診斷預設關閉；需要時 `co_install_crash_handler(1)`（不覆寫宿主 altstack；ASan 下跳過）

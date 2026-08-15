@@ -38,6 +38,7 @@ static const char *result_name(co_result r)
     case CO_RESULT_INVALID_STATE: return "CO_RESULT_INVALID_STATE";
     case CO_RESULT_OUT_OF_MEMORY: return "CO_RESULT_OUT_OF_MEMORY";
     case CO_RESULT_CANCEL_IGNORED: return "CO_RESULT_CANCEL_IGNORED";
+    case CO_RESULT_CANCEL_NOT_STARTED: return "CO_RESULT_CANCEL_NOT_STARTED";
     default: return "CO_RESULT_UNKNOWN";
     }
 }

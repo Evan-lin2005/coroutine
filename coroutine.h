@@ -21,7 +21,8 @@ typedef enum co_result {
     CO_RESULT_WRONG_THREAD,
     CO_RESULT_INVALID_STATE,
     CO_RESULT_OUT_OF_MEMORY,
-    CO_RESULT_CANCEL_IGNORED
+    CO_RESULT_CANCEL_IGNORED,
+    CO_RESULT_CANCEL_NOT_STARTED,
 } co_result;
 
 typedef struct coroutine coroutine;
@@ -66,8 +67,8 @@ typedef struct coroutine coroutine;
  *   current_coroutine 互不影響。
  *
  * Query API — 不檢查 owner、不回 WRONG_THREAD：
- *   co_finished, co_userdata, co_storage, co_storage_size, co_stack_peak,
- *   co_cls_get
+ *   co_finished, co_cancel_requested, co_userdata, co_storage, co_storage_size,
+ *   co_stack_peak, co_cls_get
  *   - 設計意圖：在 owner thread 讀取。
  *   - 與任一 mutating API（或另一執行緒上的查詢／寫入）並行存取同一
  *     coroutine * 為 data race → Undefined Behavior。
@@ -86,7 +87,7 @@ typedef struct coroutine coroutine;
  *   - callback 不可拋出 C++ 例外（本實作為 C，無法攔截）
  *   - callback 不可 longjmp 到協程外部的 jmp_buf
  *   - callback 內配置的資源必須在返回前自行釋放；C 沒有解構子，
- *     而掛起中的協程不允許銷毀（co_destroy）；提前放棄請用 co_cancel
+ *     而掛起中的協程不允許銷毀（co_destroy）；提前放棄請 co_cancel 再到 co_destroy
  *
  * 參數：
  *   - self           — 本協程（等同協程內 co_current()）
@@ -177,36 +178,39 @@ co_result  co_destroy(coroutine *co);
  * 合作式取消（co_cancel + CO_CANCEL sentinel）
  * ----------------------------------------------------------------
  * 對齊 Python GeneratorExit / Lua coroutine.close：取消是一次特殊的 resume，
- * 不是 kill、也不 unwind C stack。co_destroy(SUSPENDED/WAITING/RUNNING) 仍禁止。
+ * 不是 kill、也不 unwind C stack。co_cancel 永不釋放控制塊／堆疊；
+ * 回收一律 co_destroy。co_destroy(SUSPENDED/WAITING/RUNNING) 仍禁止。
  *
  * CO_CANCEL — 庫提供的 mailbox sentinel（不可為 NULL；NULL 表示「無訊息」）。
  * co_is_cancel(msg) — msg == CO_CANCEL 時回非 0。
+ * co_cancel_requested(co) — Query API：曾進入 co_cancel 並設下 cancelling 則非 0；
+ *   co == NULL 回 0。手動 co_resume(CO_CANCEL) 不設此旗標。
  *
- * co_cancel(co) — owner thread 合作式關閉：
- *   - CO_READY：直接 destroy（不 resume；未啟動不跑 body）
- *   - CO_DONE：直接 destroy（idempotent close）
- *   - CO_SUSPENDED：resume(CO_CANCEL)；callback 守約 return → destroy → OK
+ * co_cancel(co) — owner thread 合作式關閉（只推狀態，不 destroy）：
+ *   - CO_READY：不 resume、不跑 body；cancelling=1、state=DONE，
+ *     回 CANCEL_NOT_STARTED（指標仍有效，接著 co_destroy）
+ *   - CO_DONE：OK（已在終態；不改 cancelling）
+ *   - CO_SUSPENDED：resume(CO_CANCEL)；callback 守約 return → DONE → OK
  *   - CO_RUNNING：ALREADY_RUNNING
  *   - CO_WAITING：INVALID_STATE（非 yield 點，無法注入）
- *   - 成功：等同 destroy，coroutine* 失效
  *   - 違約（看到 sentinel 後再 yield）：CANCEL_IGNORED；協程仍 SUSPENDED，
- *     內部 cancelling 旗標保留為 1，不 destroy（堆疊上可能有未釋放資源）
- *   - 再次 co_cancel 且 cancelling 已為 1：不再注入 sentinel。
- *     debug（未定義 NDEBUG）：向 stderr 印出協程後 abort()。
- *     release（NDEBUG）：回 CANCEL_IGNORED，標為不可回收；
- *     co_thread_shutdown 將其計入 leaked_count（與其他掛起協程相同）。
+ *     cancelling 保留為 1（堆疊上可能有未釋放資源）
+ *   - 再次 co_cancel 且 cancelling 已為 1：不再注入 sentinel，回 CANCEL_IGNORED。
+ *     診斷列印僅在以 -DCO_DIAG_CANCEL=1 編譯時；不因 NDEBUG 改變語意、不 abort。
  *
  * 回呼契約：每個 yield 點（含 initial_input）須檢查 co_is_cancel；
  *   看到 cancel 後可清理資源並 return，禁止再對 caller yield。
- *   只有一次合作機會；違約後不可再靠 co_cancel 回收堆疊。
+ *   co_cancel 只有一次合作機會；違約後不可再靠 co_cancel 把協程推到 DONE。
  *   亦可 co_resume(co, CO_CANCEL, ...) 手動傳 sentinel（不設旗標、
- *   不自動 destroy）。只有 co_cancel 會設 cancelling，並在守約結束時 destroy。
+ *   不自動 destroy）。只有 co_cancel 會設 cancelling。
  *
  * co_thread_shutdown 不自動 cancel；仍有掛起協程時建議先 co_cancel 再 shutdown。
+ * 已 cancel 到 DONE 的協程由 shutdown 走正常 destroy。
  */
 extern const void *const CO_CANCEL;
 
 int       co_is_cancel(const void *msg);
+int       co_cancel_requested(const coroutine *co);
 co_result co_cancel(coroutine *co);
 
 /*

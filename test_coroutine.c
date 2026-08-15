@@ -244,6 +244,7 @@ static void test_cancel_generator(void)
     expect_eq(__LINE__, "gen resume", co_resume(co, NULL, NULL), CO_RESULT_OK);
     expect_eq(__LINE__, "gen cancel", co_cancel(co), CO_RESULT_OK);
     expect_eq(__LINE__, "gen cleaned", cleaned, 1);
+    expect_eq(__LINE__, "gen destroy", co_destroy(co), CO_RESULT_OK);
 }
 
 /* --- stress / speed test --- */

@@ -200,10 +200,10 @@ void *co_cls_get(int key);
 ### D-9：合作式取消（`co_cancel` + sentinel，已落地）
 
 - **問題**：`co_destroy` 僅允許 `CO_READY`／`CO_DONE`；提前放棄的 generator 卡在 `CO_SUSPENDED` 時 64 KiB 回不來。
-- **作法**：`co_cancel(co)` 以 `CO_CANCEL` mailbox sentinel resume 掛起協程；回呼在 yield 點用 `co_is_cancel` 檢查並 return；成功路徑自動 `co_destroy`。
-- **狀態**：`READY`／`DONE` 直接 destroy；`SUSPENDED` resume sentinel；`RUNNING`／`WAITING` 拒絕；違約再 yield → `CO_RESULT_CANCEL_IGNORED`（不偷偷 munmap）。`cancelling` 跨呼叫保留。
-- **違約終局**：第二次 `co_cancel` 見旗標已為 1 則升級——不再注入 sentinel。debug 印出協程後 `abort()`；release 回 `CANCEL_IGNORED`、標為不可回收，由 `co_thread_shutdown` 計入 leaked。守約回呼仍可一次 cancel 回收；不守約的第三方回呼不能靠重試 sentinel 拿回堆疊。
-- **維持**：`co_destroy(SUSPENDED)` 仍 `INVALID_STATE`；`co_thread_shutdown` 不自動 cancel。
+- **作法**：`co_cancel(co)` 以 `CO_CANCEL` mailbox sentinel resume 掛起協程；回呼在 yield 點用 `co_is_cancel` 檢查並 return。成功只把狀態推到 `CO_DONE`，**不**自動 destroy；回收一律 `co_destroy`。
+- **狀態**：`READY` 不跑 body、標 `DONE`、回 `CANCEL_NOT_STARTED`；`DONE` 冪等 `OK`（不改旗標）；`SUSPENDED` resume sentinel；`RUNNING`／`WAITING` 拒絕；違約再 yield → `CANCEL_IGNORED`。`cancelling` 跨呼叫保留，可由 `co_cancel_requested` 查詢。
+- **違約終局**：第二次 `co_cancel` 見旗標已為 1 則不再注入 sentinel，回 `CANCEL_IGNORED`（不因 `NDEBUG` abort）。手動 `co_resume(CO_CANCEL)` 仍可再注入（不設旗標）。opt-in 診斷：`-DCO_DIAG_CANCEL=1`。
+- **維持**：`co_destroy(SUSPENDED)` 仍 `INVALID_STATE`；`co_thread_shutdown` 不自動 cancel；已到 `DONE` 的由 shutdown 正常 destroy。
 
 ---
 
