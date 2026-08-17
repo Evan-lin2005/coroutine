@@ -16,6 +16,15 @@ struct co_stack {
 
 enum co_state { CO_READY, CO_RUNNING, CO_SUSPENDED, CO_DONE , CO_WAITING};
 
+#ifndef CO_DEFER_SLOTS
+#define CO_DEFER_SLOTS 8
+#endif
+
+struct co_defer_entry {
+    void (*fn)(void *);
+    void *arg;
+};
+
 struct coroutine {
     struct co_context context;
     struct co_stack   stack;
@@ -32,7 +41,8 @@ struct coroutine {
     void   *cls[CO_CLS_SLOTS];
     /* create 時快照；destroy 必須用同一套 alloc/free，避免中途換 g_allocator 造成 mismatch */
     co_allocator      allocator;
-    /* per-thread 存活鏈（僅 heap 協程；thread exit 時 orphan reclaim 用） */
+    /* per-thread 存活雙向鏈（僅 heap 協程；thread exit 時 orphan reclaim 用） */
+    struct coroutine *live_prev;
     struct coroutine *live_next;
 #ifdef __SANITIZE_ADDRESS__
 #  define CO_ASAN_FIELDS 1
@@ -46,18 +56,9 @@ struct coroutine {
     size_t            asan_stack_size;
     void             *asan_fake_stack;   /* start_switch 保存；finish_switch 還原 */
 #endif
-#ifndef CO_DEFER_SLOTS
-#define CO_DEFER_SLOTS 8
-#endif
-
-struct co_defer_entry{
-    void (*fn)(void *);
-    void *arg;
-};
-
-struct co_defer_entry defer[CO_DEFER_SLOTS];
-unsigned defer_count = 0;
-int defer_running = 0;
+    struct co_defer_entry defer[CO_DEFER_SLOTS];
+    unsigned defer_count;
+    int defer_running;
 };
 
 void co_context_switch(struct co_context *from, struct co_context *to);

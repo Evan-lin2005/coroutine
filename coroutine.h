@@ -235,7 +235,8 @@ co_result co_cancel(coroutine *co);
  *
  * fn 限制：不得 co_yield_now / co_resume / co_destroy；arg 不得指向協程堆疊區域變數
  * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
- * defer_running 期間 mutating API 回 INVALID_STATE。
+ * defer 執行期間以執行緒 TLS 計數守衛（三個執行點皆算，不依賴 current==co）；
+ * mutating API 回 INVALID_STATE。
  *
  * co_defer_cancel(co, fn, arg) — 取消登記 defer：
  *   - CO_SUSPENDED 無通往 CO_DONE 的強制邊；勿用 co_finished 判斷清理是否發生

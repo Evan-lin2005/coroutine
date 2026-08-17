@@ -134,7 +134,8 @@ static unsigned long long g_thread_serial; /* accessed via __atomic_* */
 static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
 static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
-static CO_THREAD_LOCAL struct coroutine *g_live_head; //thread_local's linked_list head
+static CO_THREAD_LOCAL struct coroutine *g_live_head; /* per-thread 雙向鏈頭 */
+static CO_THREAD_LOCAL int               tls_defer_running;
 
 static uint64_t co_self_thread_id(void)
 {
@@ -239,11 +240,14 @@ static void co_register_process_atexit(void)
     (void)atexit(co_orphan_reclaim_all);
 }
 
-//掛入thread_local's linked_list
+/* 掛入本執行緒 live list 頭端（O(1)） */
 static void co_live_link(struct coroutine *co)
 {
+    co->live_prev = NULL;
     co->live_next = g_live_head;
-    g_live_head   = co;
+    if (g_live_head)
+        g_live_head->live_prev = co;
+    g_live_head = co;
     co_orphan_arm();
 #if defined(_WIN32)
     if (InterlockedCompareExchange(&g_atexit_once, 1, 0) == 0)
@@ -253,19 +257,20 @@ static void co_live_link(struct coroutine *co)
 #endif
 }
 
-//銷毀時從thread_local's linked_list中移除
+/* 從本執行緒 live list 摘除（O(1)；已不在鏈上則為 no-op） */
 static void co_live_unlink(struct coroutine *co)
 {
-    struct coroutine **pp = &g_live_head;
+    if (co->live_prev)
+        co->live_prev->live_next = co->live_next;
+    else if (g_live_head == co)
+        g_live_head = co->live_next;
 
-    while (*pp) {
-        if (*pp == co) {
-            *pp = co->live_next;
-            co->live_next = NULL;
-            break;
-        }
-        pp = &(*pp)->live_next;
-    }
+    if (co->live_next)
+        co->live_next->live_prev = co->live_prev;
+
+    co->live_prev = NULL;
+    co->live_next = NULL;
+
     if (!g_live_head)
         co_orphan_disarm();
 }
@@ -359,11 +364,16 @@ static int co_is_main_coroutine(const struct coroutine *co)
     return co == &main_coroutine;
 }
 
+static int co_in_defer(void)
+{
+    return tls_defer_running > 0;
+}
+
 static co_result co_defer_validate_register(struct coroutine *co)
 {
     struct coroutine *self;
 
-    if (co->defer_running)
+    if (co_in_defer() || co->defer_running)
         return CO_RESULT_INVALID_STATE;
     if (co_is_main_coroutine(co))
         return CO_RESULT_INVALID_STATE;
@@ -384,6 +394,7 @@ static void co_run_defers(struct coroutine *co)
         return;
 
     co->defer_running = 1;
+    tls_defer_running++;
     while (co->defer_count > 0) {
         co->defer_count--;
         entry = co->defer[co->defer_count];
@@ -393,6 +404,7 @@ static void co_run_defers(struct coroutine *co)
             entry.fn(entry.arg);
     }
     co->defer_running = 0;
+    tls_defer_running--;
 }
 
 /* 僅釋放庫資源；不 resume、不跑 callback、不經公開 co_destroy 狀態檢查 */
@@ -607,6 +619,7 @@ co_result co_resume(coroutine *target, void *input, void **output)
 
     if (!target)                                    return CO_RESULT_INVALID_ARGUMENT;
     if (target->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer())                              return CO_RESULT_INVALID_STATE;
     if (current_coroutine && current_coroutine->defer_running)
         return CO_RESULT_INVALID_STATE;
     if (target->defer_running)                      return CO_RESULT_INVALID_STATE;
@@ -646,6 +659,7 @@ co_result co_yield_now(void *output, void **next_input)
     self = current_coroutine;
 
     if (!self)         return CO_RESULT_INVALID_STATE;
+    if (co_in_defer()) return CO_RESULT_INVALID_STATE;
     if (self->defer_running) return CO_RESULT_INVALID_STATE;
     if (!self->caller) return CO_RESULT_NO_CALLER;
 
@@ -731,7 +745,7 @@ co_result co_cancel(coroutine *co)
         return CO_RESULT_INVALID_ARGUMENT;
     if (co->owner_id != co_self_thread_id())
         return CO_RESULT_WRONG_THREAD;
-    if (co->defer_running)
+    if (co_in_defer() || co->defer_running)
         return CO_RESULT_INVALID_STATE;
 
     switch (co->state) {
@@ -771,7 +785,7 @@ co_result co_destroy(coroutine *co)
     if (!co)                                    return CO_RESULT_INVALID_ARGUMENT;
     /* 只有 owner thread 能釋放 coroutine */
     if (co->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
-    if (co->defer_running)                      return CO_RESULT_INVALID_STATE;
+    if (co_in_defer() || co->defer_running)     return CO_RESULT_INVALID_STATE;
     if (co->state == CO_RUNNING)                return CO_RESULT_ALREADY_RUNNING;
     /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
     if (co->state == CO_SUSPENDED ||
@@ -840,6 +854,7 @@ co_result co_set_storage(coroutine *co, void *buf, size_t cap)
 {
     if (!co) return CO_RESULT_INVALID_ARGUMENT;
     if (co->owner_id != co_self_thread_id()) return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer()) return CO_RESULT_INVALID_STATE;
     if (co->state != CO_READY) return CO_RESULT_INVALID_STATE;
     if (buf && cap == 0) return CO_RESULT_INVALID_ARGUMENT;
     if (!buf && cap > 0) return CO_RESULT_INVALID_ARGUMENT;
