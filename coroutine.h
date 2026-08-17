@@ -46,7 +46,7 @@ typedef struct coroutine coroutine;
  * 禁止以 TLS 物件位址當 id）。主協程（TLS main）亦綁定該執行緒。
  *
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
- *   co_resume, co_destroy, co_cancel, co_set_storage
+ *   co_resume, co_destroy, co_cancel, co_set_storage, co_defer, co_defer_cancel
  *
  * 執行緒結束契約：
  *   - Owner 結束前不得仍持有非 CO_DONE 的協程，除非已呼叫 co_thread_shutdown()
@@ -68,7 +68,7 @@ typedef struct coroutine coroutine;
  *
  * Query API — 不檢查 owner、不回 WRONG_THREAD：
  *   co_finished, co_cancel_requested, co_userdata, co_storage, co_storage_size,
- *   co_stack_peak, co_cls_get
+ *   co_stack_peak, co_cls_get, co_defer_count
  *   - 設計意圖：在 owner thread 讀取。
  *   - 與任一 mutating API（或另一執行緒上的查詢／寫入）並行存取同一
  *     coroutine * 為 data race → Undefined Behavior。
@@ -86,8 +86,8 @@ typedef struct coroutine coroutine;
  * 契約：
  *   - callback 不可拋出 C++ 例外（本實作為 C，無法攔截）
  *   - callback 不可 longjmp 到協程外部的 jmp_buf
- *   - callback 內配置的資源必須在返回前自行釋放；C 沒有解構子，
- *     而掛起中的協程不允許銷毀（co_destroy）；提前放棄請 co_cancel 再到 co_destroy
+ *   - callback 內配置的資源必須在返回前自行釋放，或以 co_defer 登記清理（arg 不得指向協程堆疊）；
+ *     C 沒有解構子，而掛起中的協程不允許銷毀（co_destroy）；提前放棄請 co_cancel 再到 co_destroy
  *
  * 參數：
  *   - self           — 本協程（等同協程內 co_current()）
@@ -212,6 +212,44 @@ extern const void *const CO_CANCEL;
 int       co_is_cancel(const void *msg);
 int       co_cancel_requested(const coroutine *co);
 co_result co_cancel(coroutine *co);
+
+#ifndef CO_DEFER_SLOTS
+#  define CO_DEFER_SLOTS 8
+#endif
+
+/*
+ * Defer 契約（登記清理，使資源指標脫離協程堆疊）
+ * ----------------------------------------------------------------
+ * 三動詞：co_cancel 只送請求；co_defer 只登記；co_destroy 回收庫資源並跑未執行的 defer。
+ *
+ * 允許登記者：
+ *   - 協程自身（co == co_current()，執行中）
+ *   - owner 對 CO_READY 協程（啟動前預登，補 CANCEL_NOT_STARTED 不跑 body）
+ * 拒絕：TLS main、defer_running、非 owner、其餘狀態。
+ *
+ * 執行點（LIFO、恰好一次、執行後 defer_count == 0）：
+ *   1. trampoline — callback 返回後、CO_DONE 前（含守約 cancel）
+ *   2. co_destroy — unlink 後、co_stack_destroy 前
+ *   3. orphan 安全網 — 同 destroy 順序（thread exit / atexit）
+ * co_cancel 違約（CANCEL_IGNORED）不跑 defer；thread-exit 才補跑。
+ *
+ * fn 限制：不得 co_yield_now / co_resume / co_destroy；arg 不得指向協程堆疊區域變數
+ * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
+ * defer_running 期間 mutating API 回 INVALID_STATE。
+ *
+ * co_defer_cancel(co, fn, arg) — 取消登記 defer：
+ *   - CO_SUSPENDED 無通往 CO_DONE 的強制邊；勿用 co_finished 判斷清理是否發生
+ *     （READY 取消 finished==1 但 body 未跑；用 CANCEL_NOT_STARTED 區分）
+ *   - 兩種 CANCEL_IGNORED 公開 API 無法區分
+ *
+ * 範例：
+ *   char *buf = malloc(SZ); co_defer(self, free, buf);
+ *   co_defer(co, destroy_ctx, ctx);  // CO_READY 預登
+ *   if (co_cancel(co) == CO_RESULT_CANCEL_NOT_STARTED) co_destroy(co);
+ */
+co_result co_defer(coroutine *co, void (*fn)(void *), void *arg);
+co_result co_defer_cancel(coroutine *co, void (*fn)(void *), void *arg);
+size_t    co_defer_count(const coroutine *co);
 
 /*
  * co_thread_shutdown — owner 執行緒結束前清理名下協程（caller 義務入口）。

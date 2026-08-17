@@ -151,6 +151,7 @@ static uint64_t co_self_thread_id(void)
 
 static void ensure_initialized(void);
 static void co_live_unlink(struct coroutine *co);
+static void co_run_defers(struct coroutine *co);
 static void co_internal_reclaim_orphan(struct coroutine *co);
 
 /* ------------------------------------------------------------------ *
@@ -183,6 +184,7 @@ static void co_orphan_reclaim_all(void)
 #if defined(_WIN32)
 static DWORD g_orphan_fls = FLS_OUT_OF_INDEXES;
 static LONG  g_orphan_fls_once;
+static LONG  g_atexit_once;
 
 static void NTAPI co_orphan_fls_dtor(void *p)
 {
@@ -190,7 +192,6 @@ static void NTAPI co_orphan_fls_dtor(void *p)
     co_orphan_reclaim_all();
 }
 
-//掛上退出回呼函數
 static void co_orphan_arm(void)
 {
     if (InterlockedCompareExchange(&g_orphan_fls_once, 1, 0) == 0)
@@ -207,6 +208,7 @@ static void co_orphan_disarm(void)
 #else
 static pthread_key_t  g_orphan_key;
 static pthread_once_t g_orphan_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
 
 static void co_orphan_key_dtor(void *p)
 {
@@ -232,12 +234,23 @@ static void co_orphan_disarm(void)
 }
 #endif
 
+static void co_register_process_atexit(void)
+{
+    (void)atexit(co_orphan_reclaim_all);
+}
+
 //掛入thread_local's linked_list
 static void co_live_link(struct coroutine *co)
 {
     co->live_next = g_live_head;
     g_live_head   = co;
     co_orphan_arm();
+#if defined(_WIN32)
+    if (InterlockedCompareExchange(&g_atexit_once, 1, 0) == 0)
+        (void)atexit(co_orphan_reclaim_all);
+#else
+    pthread_once(&g_atexit_once, co_register_process_atexit);
+#endif
 }
 
 //銷毀時從thread_local's linked_list中移除
@@ -341,6 +354,47 @@ static void co_mem_free_with(const co_allocator *a, void *p, size_t n)
         a->free(p, n, a->userdata);
 }
 
+static int co_is_main_coroutine(const struct coroutine *co)
+{
+    return co == &main_coroutine;
+}
+
+static co_result co_defer_validate_register(struct coroutine *co)
+{
+    struct coroutine *self;
+
+    if (co->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))
+        return CO_RESULT_INVALID_STATE;
+
+    self = current_coroutine;
+    if (self == co)
+        return CO_RESULT_OK;
+    if (co->state == CO_READY)
+        return CO_RESULT_OK;
+    return CO_RESULT_INVALID_STATE;
+}
+
+static void co_run_defers(struct coroutine *co)
+{
+    struct co_defer_entry entry;
+
+    if (!co || co->defer_count == 0)
+        return;
+
+    co->defer_running = 1;
+    while (co->defer_count > 0) {
+        co->defer_count--;
+        entry = co->defer[co->defer_count];
+        co->defer[co->defer_count].fn  = NULL;
+        co->defer[co->defer_count].arg = NULL;
+        if (entry.fn)
+            entry.fn(entry.arg);
+    }
+    co->defer_running = 0;
+}
+
 /* 僅釋放庫資源；不 resume、不跑 callback、不經公開 co_destroy 狀態檢查 */
 static void co_internal_reclaim_orphan(struct coroutine *co)
 {
@@ -350,10 +404,10 @@ static void co_internal_reclaim_orphan(struct coroutine *co)
         return;
     snap = co->allocator;
     co_live_unlink(co);
-    co_stack_destroy(&co->stack);//釋放giber執行stack
+    co_run_defers(co);
+    co_stack_destroy(&co->stack);
     co->owner_id = 0;
-    co_mem_free_with(&snap, co, sizeof *co);//釋放coroutine結構體
-    //不釋放呼叫端的記憶體
+    co_mem_free_with(&snap, co, sizeof *co);
 }
 
 //設置allocator 
@@ -475,6 +529,7 @@ void co_trampoline_body(void)
     self->mailbox   = NULL;
     self->function(self, self->userdata, initial_input); /* 契約見標頭 */
 
+    co_run_defers(self);
     self->state       = CO_DONE;
     caller            = self->caller;
     current_coroutine = caller;
@@ -552,6 +607,9 @@ co_result co_resume(coroutine *target, void *input, void **output)
 
     if (!target)                                    return CO_RESULT_INVALID_ARGUMENT;
     if (target->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (current_coroutine && current_coroutine->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (target->defer_running)                      return CO_RESULT_INVALID_STATE;
     if (target->state == CO_RUNNING)           return CO_RESULT_ALREADY_RUNNING;
     if (target->state == CO_DONE)              return CO_RESULT_FINISHED;
     if (target->state == CO_WAITING)           return CO_RESULT_INVALID_STATE;
@@ -588,6 +646,7 @@ co_result co_yield_now(void *output, void **next_input)
     self = current_coroutine;
 
     if (!self)         return CO_RESULT_INVALID_STATE;
+    if (self->defer_running) return CO_RESULT_INVALID_STATE;
     if (!self->caller) return CO_RESULT_NO_CALLER;
 
     caller            = self->caller;
@@ -672,6 +731,8 @@ co_result co_cancel(coroutine *co)
         return CO_RESULT_INVALID_ARGUMENT;
     if (co->owner_id != co_self_thread_id())
         return CO_RESULT_WRONG_THREAD;
+    if (co->defer_running)
+        return CO_RESULT_INVALID_STATE;
 
     switch (co->state) {
     case CO_READY:
@@ -710,6 +771,7 @@ co_result co_destroy(coroutine *co)
     if (!co)                                    return CO_RESULT_INVALID_ARGUMENT;
     /* 只有 owner thread 能釋放 coroutine */
     if (co->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (co->defer_running)                      return CO_RESULT_INVALID_STATE;
     if (co->state == CO_RUNNING)                return CO_RESULT_ALREADY_RUNNING;
     /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
     if (co->state == CO_SUSPENDED ||
@@ -718,6 +780,7 @@ co_result co_destroy(coroutine *co)
     {
         co_allocator snap = co->allocator;
         co_live_unlink(co);
+        co_run_defers(co);
         co_stack_destroy(&co->stack);
         co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
         co_mem_free_with(&snap, co, sizeof *co);
@@ -796,4 +859,65 @@ size_t co_storage_size(coroutine *co)
 {
     if (!co) return 0;
     return co->st_cap;
+}
+
+co_result co_defer(coroutine *co, void (*fn)(void *), void *arg)
+{
+    co_result vr;
+
+    if (!co || !fn)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+
+    ensure_initialized();
+
+    vr = co_defer_validate_register(co);
+    if (vr != CO_RESULT_OK)
+        return vr;
+    if (co->defer_count >= CO_DEFER_SLOTS)
+        return CO_RESULT_OUT_OF_MEMORY;
+
+    co->defer[co->defer_count].fn  = fn;
+    co->defer[co->defer_count].arg = arg;
+    co->defer_count++;
+    return CO_RESULT_OK;
+}
+
+co_result co_defer_cancel(coroutine *co, void (*fn)(void *), void *arg)
+{
+    unsigned i;
+    co_result vr;
+
+    if (!co || !fn)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+
+    ensure_initialized();
+
+    vr = co_defer_validate_register(co);
+    if (vr != CO_RESULT_OK)
+        return vr;
+
+    for (i = co->defer_count; i > 0; ) {
+        i--;
+        if (co->defer[i].fn == fn && co->defer[i].arg == arg) {
+            for (; i + 1 < co->defer_count; i++) {
+                co->defer[i] = co->defer[i + 1];
+            }
+            co->defer_count--;
+            co->defer[co->defer_count].fn  = NULL;
+            co->defer[co->defer_count].arg = NULL;
+            return CO_RESULT_OK;
+        }
+    }
+    return CO_RESULT_INVALID_ARGUMENT;
+}
+
+size_t co_defer_count(const coroutine *co)
+{
+    if (!co)
+        return 0;
+    return (size_t)co->defer_count;
 }
