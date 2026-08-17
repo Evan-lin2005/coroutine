@@ -233,7 +233,8 @@ co_result co_cancel(coroutine *co);
  *   3. orphan 安全網 — 同 destroy 順序（thread exit / atexit）
  * co_cancel 違約（CANCEL_IGNORED）不跑 defer；thread-exit 才補跑。
  *
- * fn 限制：不得 co_yield_now / co_resume / co_destroy；arg 不得指向協程堆疊區域變數
+ * fn 限制：不得 co_yield_now / co_resume / co_destroy / co_thread_shutdown /
+ * co_cls_set；arg 不得指向協程堆疊區域變數
  * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
  * defer 執行期間以執行緒 TLS 計數守衛（三個執行點皆算，不依賴 current==co）；
  * mutating API 回 INVALID_STATE。
@@ -267,6 +268,7 @@ size_t    co_defer_count(const coroutine *co);
  *
  * leaked_count 可為 NULL（仍回傳上述結果碼）。
  * 不 reclaim 掛起中協程（那是 thread-exit 安全網的路徑）。
+ * defer 執行期間回 CO_RESULT_INVALID_STATE，不掃表（*leaked_count == 0）。
  */
 co_result  co_thread_shutdown(size_t *leaked_count);
 
@@ -364,6 +366,8 @@ size_t     co_storage_size(coroutine *co);
  * co_cls_set(key, value) — 寫入 co_current()->cls[key]。
  *   - 成功：CO_RESULT_OK
  *   - key < 0 或 key >= CO_CLS_SLOTS：CO_RESULT_INVALID_ARGUMENT
+ *   - defer 執行期間：CO_RESULT_INVALID_STATE（寫的是 co_current()，destroy/orphan
+ *     路徑上那是銷毀者而非垂死協程）
  *   - value 可為 NULL（表示清除槽位；與「從未設定」在 co_cls_get 上同為 NULL）
  *   - 不檢查 owner_id；操作呼叫執行緒的 current_coroutine（含 main）
  *   - 庫只存 void*；指向物件由呼叫端擁有；不 malloc / free / deep copy

@@ -507,6 +507,8 @@ co_result co_cls_set(co_cls_key key, void *value)
 
     if (key < 0 || key >= CO_CLS_SLOTS)
         return CO_RESULT_INVALID_ARGUMENT;
+    if (co_in_defer())
+        return CO_RESULT_INVALID_STATE;
 
     self = co_current();
     self->cls[key] = value;
@@ -805,9 +807,15 @@ co_result co_destroy(coroutine *co)
 co_result co_thread_shutdown(size_t *leaked_count)
 {
     struct coroutine *co;
-    size_t            leaked = 0;
+    size_t leaked = 0;
 
     ensure_initialized();
+
+    if (co_in_defer()) {
+        if (leaked_count)
+            *leaked_count = 0;
+        return CO_RESULT_INVALID_STATE;
+    }
 
     co = g_live_head;
     while (co) {

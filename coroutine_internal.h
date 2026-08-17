@@ -16,10 +16,6 @@ struct co_stack {
 
 enum co_state { CO_READY, CO_RUNNING, CO_SUSPENDED, CO_DONE , CO_WAITING};
 
-#ifndef CO_DEFER_SLOTS
-#define CO_DEFER_SLOTS 8
-#endif
-
 struct co_defer_entry {
     void (*fn)(void *);
     void *arg;
