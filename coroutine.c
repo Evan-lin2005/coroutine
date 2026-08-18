@@ -235,10 +235,12 @@ static void co_orphan_disarm(void)
 }
 #endif
 
+#if !defined(_WIN32)
 static void co_register_process_atexit(void)
 {
     (void)atexit(co_orphan_reclaim_all);
 }
+#endif
 
 /* 掛入本執行緒 live list 頭端（O(1)） */
 static void co_live_link(struct coroutine *co)
@@ -408,16 +410,32 @@ static void co_run_defers(struct coroutine *co)
 }
 
 /* 僅釋放庫資源；不 resume、不跑 callback、不經公開 co_destroy 狀態檢查 */
+static int co_frame_on_stack(const struct co_stack *st, const void *sp)
+{
+    if (!st || !st->lo || !st->hi || !sp)
+        return 0;
+    return (const char *)sp >= (const char *)st->lo &&
+           (const char *)sp <  (const char *)st->hi;
+}
+
 static void co_internal_reclaim_orphan(struct coroutine *co)
 {
     co_allocator snap;
+    void *sp;
 
     if (!co)
         return;
     snap = co->allocator;
     co_live_unlink(co);
     co_run_defers(co);
-    co_stack_destroy(&co->stack);
+    sp = __builtin_frame_address(0);
+    /*
+     * TLS/atexit 可能仍在這塊 mmap 上執行。munmap 腳下會在返回時 SIGSEGV
+     * （exit() 自協程、以及在 fiber 上跑 TSD/FLS 的 libc）。略過 unmap，
+     * 讓行程結束回收 VMA；控制塊仍可釋放（在 heap）。
+     */
+    if (!co_frame_on_stack(&co->stack, sp))
+        co_stack_destroy(&co->stack);
     co->owner_id = 0;
     co_mem_free_with(&snap, co, sizeof *co);
 }
@@ -899,7 +917,7 @@ co_result co_defer(coroutine *co, void (*fn)(void *), void *arg)
     if (vr != CO_RESULT_OK)
         return vr;
     if (co->defer_count >= CO_DEFER_SLOTS)
-        return CO_RESULT_OUT_OF_MEMORY;
+        return CO_RESULT_OUT_OF_MEMORY; /* 未入表；呼叫端須自行清理 arg */
 
     co->defer[co->defer_count].fn  = fn;
     co->defer[co->defer_count].arg = arg;

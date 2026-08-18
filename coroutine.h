@@ -233,6 +233,9 @@ co_result co_cancel(coroutine *co);
  *   3. orphan 安全網 — 同 destroy 順序（thread exit / atexit）
  * co_cancel 違約（CANCEL_IGNORED）不跑 defer；thread-exit 才補跑。
  *
+ * 槽滿回 CO_RESULT_OUT_OF_MEMORY：fn/arg 未入表，呼叫端仍持有 arg，須自行清理
+ * （失敗路徑不會呼叫 fn）。
+ *
  * fn 限制：不得 co_yield_now / co_resume / co_destroy / co_thread_shutdown /
  * co_cls_set；arg 不得指向協程堆疊區域變數
  * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
@@ -245,7 +248,8 @@ co_result co_cancel(coroutine *co);
  *   - 兩種 CANCEL_IGNORED 公開 API 無法區分
  *
  * 範例：
- *   char *buf = malloc(SZ); co_defer(self, free, buf);
+ *   char *buf = malloc(SZ);
+ *   if (co_defer(self, free, buf) != CO_RESULT_OK) { free(buf); return; }
  *   co_defer(co, destroy_ctx, ctx);  // CO_READY 預登
  *   if (co_cancel(co) == CO_RESULT_CANCEL_NOT_STARTED) co_destroy(co);
  */
