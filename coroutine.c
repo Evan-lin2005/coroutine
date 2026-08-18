@@ -7,30 +7,554 @@
 
 #include "coroutine_internal.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
-/* C23/C11 版本差異 */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
+
+/* 考慮不同compiler的差異 */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define CO_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 #  define CO_THREAD_LOCAL thread_local
 #else
 #  define CO_THREAD_LOCAL _Thread_local
 #endif
 
+/*
+ * ASan fiber 切換註解
+ * ----------------------------------------------------------------
+ * 依 LLVM sanitizer 契約：start 在切換前呼叫（fake_stack 存於 from 協程），
+ * finish 在目標 stack 開始執行時（trampoline）或切換返回 from 時呼叫。
+ * main 邊界以平台 API 在 ensure_initialized 一次取得，不依賴 finish 配對。
+ */
+#ifdef __SANITIZE_ADDRESS__
+#  define CO_ASAN_FIBER 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define CO_ASAN_FIBER 1
+#  endif
+#endif
+#ifndef CO_ASAN_FIBER
+#  define CO_ASAN_FIBER 0
+#endif
+
+#if CO_ASAN_FIBER
+extern void __sanitizer_start_switch_fiber(void **fake_stack_save,
+                                           const void *bottom,
+                                           size_t size);
+extern void __sanitizer_finish_switch_fiber(void *fake_stack_save,
+                                            const void **bottom_old,
+                                            size_t *size_old);
+
+static size_t co_asan_stack_bytes(const struct co_stack *st)
+{
+    if (!st || !st->lo || !st->hi || st->hi <= st->lo)
+        return 0;
+    return (size_t)(st->hi - st->lo);
+}
+
+static void co_asan_start_switch(struct coroutine *from_co,
+                                 const struct coroutine *to_co)
+{
+    const void *bottom = NULL;
+    size_t      size   = 0;
+
+    if (to_co) {
+        if (to_co->stack.lo == NULL) {
+            bottom = to_co->asan_stack_bottom;
+            size   = to_co->asan_stack_size;
+        } else {
+            bottom = to_co->stack.lo;
+            size   = co_asan_stack_bytes(&to_co->stack);
+        }
+    }
+
+    __sanitizer_start_switch_fiber(from_co ? &from_co->asan_fake_stack : NULL,
+                                   bottom, size);
+}
+
+static void co_asan_finish_switch(struct coroutine *fake_stack_owner)
+{
+    const void *bottom_old = NULL;
+    size_t      size_old   = 0;
+    void       *fs = fake_stack_owner ? fake_stack_owner->asan_fake_stack : NULL;
+
+    __sanitizer_finish_switch_fiber(fs, &bottom_old, &size_old);
+}
+
+static void co_do_switch(struct co_context *from, struct co_context *to,
+                         struct coroutine *from_co, struct coroutine *to_co)
+{
+    co_asan_start_switch(from_co, to_co);
+    co_context_switch(from, to);
+    /* 回到 from：還原 from 離開時保存的 fake stack */
+    co_asan_finish_switch(from_co);
+}
+
+static void co_asan_finish_on_enter(struct coroutine *caller)
+{
+    /* 首次進入 fiber：finish 使用 caller 在 start_switch 時保存的 fake stack */
+    co_asan_finish_switch(caller);
+}
+#else
+static void co_do_switch(struct co_context *from, struct co_context *to,
+                         struct coroutine *from_co, struct coroutine *to_co)
+{
+    (void)from_co;
+    (void)to_co;
+    co_context_switch(from, to);
+}
+
+static void co_asan_finish_on_enter(struct coroutine *from_co)
+{
+    (void)from_co;
+}
+#endif
+
 /* ------------------------------------------------------------------ *
- * thread-local 狀態
+ * thread-local 狀態 / owner 身分（單調序號，不回收）
  * ------------------------------------------------------------------ */
-static CO_THREAD_LOCAL unsigned char   thread_token;
-static CO_THREAD_LOCAL struct coroutine main_coroutine;
+#if defined(_WIN32) && (defined(_MSC_VER) && !defined(__clang__))
+static volatile LONG64 g_thread_serial;
+#else
+static unsigned long long g_thread_serial; /* accessed via __atomic_* */
+#endif
+
+static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
+static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
+static CO_THREAD_LOCAL struct coroutine *g_live_head; /* per-thread 雙向鏈頭 */
+static CO_THREAD_LOCAL int               tls_defer_running;
+
+static uint64_t co_self_thread_id(void)
+{
+    if (thread_id == 0) {
+#if defined(_WIN32) && (defined(_MSC_VER) && !defined(__clang__))
+        thread_id = (uint64_t)InterlockedIncrement64(&g_thread_serial);
+#else
+        thread_id = (uint64_t)__atomic_fetch_add(&g_thread_serial, 1ull,
+                                                 __ATOMIC_RELAXED) + 1ull;
+#endif
+    }
+    return thread_id;
+}
+
+static void ensure_initialized(void);
+static void co_live_unlink(struct coroutine *co);
+static void co_run_defers(struct coroutine *co);
+static void co_release_owned(struct coroutine *co);
+static void co_internal_reclaim_orphan(struct coroutine *co);
+
+/* ------------------------------------------------------------------ *
+ * thread-exit 安全網：owner 結束時 reclaim 庫資源（非公開 kill 語意）
+ * ------------------------------------------------------------------ */
+static void co_orphan_reclaim_all(void)
+{
+    /*
+     * 與 co_thread_shutdown 一致：DONE/READY 可合法銷毀，靜默回收；
+     * 僅 SUSPENDED/WAITING/RUNNING 計入警告（真正無法乾淨結束的掛起態）。
+     */
+    size_t leaked = 0;
+
+    while (g_live_head) {
+        struct coroutine *co = g_live_head;
+        enum co_state     st = co->state;
+
+        if (st != CO_DONE && st != CO_READY)
+            leaked++;
+        co_internal_reclaim_orphan(co);
+    }
+    if (leaked > 0) {
+        fprintf(stderr,
+                "coroutine orphan: owner thread exited with %zu suspended "
+                "coroutine(s); library resources reclaimed\n",
+                leaked);
+    }
+}
+
+#if defined(_WIN32)
+static DWORD g_orphan_fls = FLS_OUT_OF_INDEXES;
+static LONG  g_orphan_fls_once;
+static LONG  g_atexit_once;
+
+static void NTAPI co_orphan_fls_dtor(void *p)
+{
+    (void)p;
+    co_orphan_reclaim_all();
+}
+
+static void co_orphan_arm(void)
+{
+    if (InterlockedCompareExchange(&g_orphan_fls_once, 1, 0) == 0)
+        g_orphan_fls = FlsAlloc(co_orphan_fls_dtor);
+    if (g_orphan_fls != FLS_OUT_OF_INDEXES)
+        FlsSetValue(g_orphan_fls, (void *)(uintptr_t)1);
+}
+
+static void co_orphan_disarm(void)
+{
+    if (g_orphan_fls != FLS_OUT_OF_INDEXES)
+        FlsSetValue(g_orphan_fls, NULL);
+}
+#else
+static pthread_key_t  g_orphan_key;
+static pthread_once_t g_orphan_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
+
+static void co_orphan_key_dtor(void *p)
+{
+    (void)p;
+    co_orphan_reclaim_all();
+}
+
+static void co_orphan_key_create(void)
+{
+    (void)pthread_key_create(&g_orphan_key, co_orphan_key_dtor);
+}
+
+static void co_orphan_arm(void)
+{
+    pthread_once(&g_orphan_once, co_orphan_key_create);
+    (void)pthread_setspecific(g_orphan_key, (void *)(uintptr_t)1);
+}
+
+static void co_orphan_disarm(void)
+{
+    pthread_once(&g_orphan_once, co_orphan_key_create);
+    (void)pthread_setspecific(g_orphan_key, NULL);
+}
+#endif
+
+#if !defined(_WIN32)
+static void co_register_process_atexit(void)
+{
+    (void)atexit(co_orphan_reclaim_all);
+}
+#endif
+
+/* 掛入本執行緒 live list 頭端（O(1)） */
+static void co_live_link(struct coroutine *co)
+{
+    co->live_prev = NULL;
+    co->live_next = g_live_head;
+    if (g_live_head)
+        g_live_head->live_prev = co;
+    g_live_head = co;
+    co_orphan_arm();
+#if defined(_WIN32)
+    if (InterlockedCompareExchange(&g_atexit_once, 1, 0) == 0)
+        (void)atexit(co_orphan_reclaim_all);
+#else
+    pthread_once(&g_atexit_once, co_register_process_atexit);
+#endif
+}
+
+/* 從本執行緒 live list 摘除（O(1)；已不在鏈上則為 no-op） */
+static void co_live_unlink(struct coroutine *co)
+{
+    if (co->live_prev)
+        co->live_prev->live_next = co->live_next;
+    else if (g_live_head == co)
+        g_live_head = co->live_next;
+
+    if (co->live_next)
+        co->live_next->live_prev = co->live_prev;
+
+    co->live_prev = NULL;
+    co->live_next = NULL;
+
+    if (!g_live_head)
+        co_orphan_disarm();
+}
 
 static void ensure_initialized(void)
 {
     co_platform_initialize();
     if (!current_coroutine) {
-        current_coroutine          = &main_coroutine;
-        main_coroutine.state       = CO_RUNNING;
-        main_coroutine.owner_token = &thread_token;
+        current_coroutine       = &main_coroutine;
+        main_coroutine.state    = CO_RUNNING;
+        main_coroutine.owner_id = co_self_thread_id();
+//掛上asan_stack_bottom和asan_stack_size，Asan需要知道主協程（main）的 OS 執行緒堆疊邊界
+#if CO_ASAN_FIBER
+        {
+            const void *bottom = NULL;
+            size_t      sz     = 0;
+            if (co_platform_query_thread_stack(&bottom, &sz) == 0) {
+                main_coroutine.asan_stack_bottom = bottom;
+                main_coroutine.asan_stack_size   = sz;
+            }
+        }
+#endif
     }
+}
+
+static void *co_exchange_and_switch(struct coroutine *from,
+                                    struct coroutine *to,
+                                    void *outgoing);
+
+/* ------------------------------------------------------------------ *
+ * allocator — 僅 struct coroutine；g_allocator 為 co_set_allocator 的副本
+ * ------------------------------------------------------------------ */
+static co_allocator g_allocator;
+
+_Static_assert(_Alignof(struct coroutine) <= CO_ALLOC_ALIGN,
+               "struct coroutine alignment exceeds CO_ALLOC_ALIGN");
+
+enum { co_obj_align = _Alignof(struct coroutine) };
+
+//檢查指標是否對齊
+static int co_ptr_aligned(const void *p)
+{
+    const uintptr_t mask = (uintptr_t)co_obj_align - 1u;
+    return ((uintptr_t)p & mask) == 0;
+}
+
+//分配記憶體
+static co_result co_mem_alloc(size_t n, void **out)
+{
+    void *p;
+
+    if (!out)
+        return CO_RESULT_INVALID_ARGUMENT;
+    *out = NULL;
+
+    if (!g_allocator.alloc) {
+        p = calloc(1, n);
+        if (!p)
+            return CO_RESULT_OUT_OF_MEMORY;
+        *out = p;
+        return CO_RESULT_OK;
+    }
+
+    p = g_allocator.alloc(n, g_allocator.userdata);
+    if (!p)
+        return CO_RESULT_OUT_OF_MEMORY;
+    if (!co_ptr_aligned(p)) {//檢查指標是否對齊
+        if (g_allocator.free)//如果分配失敗，釋放記憶體
+            g_allocator.free(p, n, g_allocator.userdata);
+        return CO_RESULT_INVALID_ARGUMENT;
+    }
+    *out = p;
+    return CO_RESULT_OK;
+}
+
+/* 以 create 時快照的 allocator 釋放，避免與當前 g_allocator mismatch */
+static void co_mem_free_with(const co_allocator *a, void *p, size_t n)
+{
+    if (!p)
+        return;
+    if (!a || !a->alloc) {
+        free(p);
+        return;
+    }
+    if (a->free)
+        a->free(p, n, a->userdata);
+}
+
+static int co_is_main_coroutine(const struct coroutine *co)
+{
+    return co == &main_coroutine;
+}
+
+static int co_in_defer(void)
+{
+    return tls_defer_running > 0;
+}
+
+static co_result co_defer_validate_register(struct coroutine *co)
+{
+    struct coroutine *self;
+
+    if (co_in_defer() || co->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))
+        return CO_RESULT_INVALID_STATE;
+
+    self = current_coroutine;
+    if (self == co)
+        return CO_RESULT_OK;
+    if (co->state == CO_READY)
+        return CO_RESULT_OK;
+    return CO_RESULT_INVALID_STATE;
+}
+
+static void co_run_defers(struct coroutine *co)
+{
+    struct co_defer_entry entry;
+
+    if (!co || co->defer_count == 0)
+        return;
+
+    co->defer_running = 1;
+    tls_defer_running++;
+    while (co->defer_count > 0) {
+        co->defer_count--;
+        entry = co->defer[co->defer_count];
+        co->defer[co->defer_count].fn  = NULL;
+        co->defer[co->defer_count].arg = NULL;
+        if (entry.fn)
+            entry.fn(entry.arg);
+    }
+    co->defer_running = 0;
+    tls_defer_running--;
+}
+
+/* 已通過合法性檢查：unlink → defer → 釋放堆疊與控制塊；之後指標失效 */
+static void co_release_owned(struct coroutine *co)
+{
+    co_allocator snap = co->allocator;
+
+    co_live_unlink(co);
+    co_run_defers(co);
+    co_stack_destroy(&co->stack);
+    co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
+    co_mem_free_with(&snap, co, sizeof *co);
+}
+
+static int co_frame_on_stack(const struct co_stack *st, const void *sp)
+{
+    if (!st || !st->lo || !st->hi || !sp)
+        return 0;
+    return (const char *)sp >= (const char *)st->lo &&
+           (const char *)sp <  (const char *)st->hi;
+}
+
+static void co_internal_reclaim_orphan(struct coroutine *co)
+{
+    /* 不 resume、不經公開 destroy 狀態檢查；可能略過 munmap（見下） */
+    co_allocator snap;
+    void *sp;
+
+    if (!co)
+        return;
+    snap = co->allocator;
+    co_live_unlink(co);
+    co_run_defers(co);
+    sp = __builtin_frame_address(0);
+    /*
+     * TLS/atexit 可能仍在這塊 mmap 上執行。munmap 腳下會在返回時 SIGSEGV
+     * （exit() 自協程、以及在 fiber 上跑 TSD/FLS 的 libc）。略過 unmap，
+     * 讓行程結束回收 VMA；控制塊仍可釋放（在 heap）。
+     */
+    if (!co_frame_on_stack(&co->stack, sp))
+        co_stack_destroy(&co->stack);
+    co->owner_id = 0;
+    co_mem_free_with(&snap, co, sizeof *co);
+}
+
+//設置allocator 
+void co_set_allocator(const co_allocator *a)
+{
+    if (!a || (!a->alloc && !a->free)) {
+        memset(&g_allocator, 0, sizeof g_allocator);
+        return;
+    }
+    if (!a->alloc) {
+        memset(&g_allocator, 0, sizeof g_allocator);
+        return;
+    }
+    g_allocator = *a;
+}
+
+void co_install_crash_handler(int enable)
+{
+    if (!enable)
+        return;
+    ensure_initialized();
+    (void)co_platform_install_crash_handler();
+}
+
+/* ------------------------------------------------------------------ *
+ * CLS — process-global key + per-coroutine value slots
+ * 全域key + 每個協程的value slots，原子操作
+ * ------------------------------------------------------------------ */
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <windows.h>
+
+static unsigned co_atomic_load_relaxed(unsigned *p)
+{
+    return (unsigned)InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+}
+
+static int co_atomic_compare_exchange_relaxed(unsigned *p,
+                                              unsigned *expected,
+                                              unsigned desired)
+{
+    LONG prev = InterlockedCompareExchange((volatile LONG *)p,
+                                           (LONG)desired,
+                                           (LONG)*expected);
+    if ((unsigned)prev == *expected)
+        return 1;
+    *expected = (unsigned)prev;
+    return 0;
+}
+#else
+static unsigned co_atomic_load_relaxed(unsigned *p)
+{
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
+static int co_atomic_compare_exchange_relaxed(unsigned *p,
+                                              unsigned *expected,
+                                              unsigned desired)
+{
+    return __atomic_compare_exchange_n(p, expected, desired, 1,
+                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+#endif
+
+static unsigned g_cls_next;
+
+co_cls_key co_cls_alloc(void)
+{
+    unsigned current;
+
+    for (;;) {
+        current = co_atomic_load_relaxed(&g_cls_next);
+        if (current >= CO_CLS_SLOTS)
+            return CO_CLS_KEY_INVALID;
+        if (co_atomic_compare_exchange_relaxed(&g_cls_next, &current, current + 1))
+            return (co_cls_key)current;
+    }
+}
+
+
+
+co_result co_cls_set(co_cls_key key, void *value)
+{
+    struct coroutine *self;
+
+    if (key < 0 || key >= CO_CLS_SLOTS)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co_in_defer())
+        return CO_RESULT_INVALID_STATE;
+
+    self = co_current();
+    self->cls[key] = value;
+    return CO_RESULT_OK;
+}
+
+void *co_cls_get(co_cls_key key)
+{
+    struct coroutine *self;
+
+    if (key < 0 || key >= CO_CLS_SLOTS)
+        return NULL;
+
+    self = co_current();
+    return self->cls[key];
 }
 
 /* ------------------------------------------------------------------ *
@@ -40,14 +564,25 @@ void co_trampoline_body(void)
 {
     struct coroutine *self = current_coroutine;
     struct coroutine *caller;
+    void             *initial_input;
 
-    self->function(self->argument);   /* C 沒有例外可攔截；契約見標頭 */
+    /* P0：首次進入 fiber 時 finish 來自 caller 的 start_switch 狀態 */
+    co_asan_finish_on_enter(self->caller);
 
+    /* 首次 resume 的 input：消費 mailbox 後交給 callback */
+    initial_input   = self->mailbox;
+    self->mailbox   = NULL;
+    self->function(self, self->userdata, initial_input); /* 契約見標頭 */
+
+    co_run_defers(self);
     self->state       = CO_DONE;
     caller            = self->caller;
     current_coroutine = caller;
 
-    co_context_switch(&self->context, &caller->context);
+    /* 正常結束：無 output；避免 co_resume 讀到過期 mailbox */
+    caller->mailbox = NULL;
+
+    co_do_switch(&self->context, &caller->context, self, caller);
     abort();    /* 已完成的協程不該被再次進入 */
 }
 
@@ -56,42 +591,74 @@ void co_bad_return(void) { abort(); }
 /* ------------------------------------------------------------------ *
  * public API
  * ------------------------------------------------------------------ */
-coroutine *co_create(size_t stack_size, co_function function, void *argument)
+co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
+                      coroutine **out)
 {
     struct coroutine *co;
 
+    if (!out) return CO_RESULT_INVALID_ARGUMENT;
+    *out = NULL;
+
     ensure_initialized();
 
-    if (!function || stack_size < CO_MIN_STACK_SIZE) return NULL;
+    if (!function || stack_size < CO_MIN_STACK_SIZE ||
+        stack_size > CO_MAX_STACK_SIZE)
+        return CO_RESULT_INVALID_ARGUMENT;
 
-    co = calloc(1, sizeof *co);
-    if (!co) return NULL;
+    co_result ar;
+
+    ar = co_mem_alloc(sizeof *co, (void **)&co);
+    if (ar != CO_RESULT_OK)
+        return ar;
+    if (g_allocator.alloc)
+        memset(co, 0, sizeof *co);
+
+    /* 快照當前 allocator；destroy 永遠用此副本，不依賴之後的 co_set_allocator */
+    co->allocator = g_allocator;
 
     if (co_stack_create(&co->stack, stack_size) != 0) {
-        free(co);
-        return NULL;
+        co_allocator snap = co->allocator;
+        co_mem_free_with(&snap, co, sizeof *co);
+        return CO_RESULT_OUT_OF_MEMORY;
     }
-
-    co->function    = function;
-    co->argument    = argument;
-    co->state       = CO_READY;
-    co->owner_token = &thread_token;
+    co->function  = function;
+    co->userdata  = userdata;
+    co->state     = CO_READY;
+    co->owner_id  = co_self_thread_id();
 
     initialize_context(co);
+    co_live_link(co);
+    *out = co;
+    return CO_RESULT_OK;
+}
+
+coroutine *co_create(size_t stack_size, co_function function, void *userdata)
+{
+    coroutine *co = NULL;
+
+    if (co_create_ex(stack_size, function, userdata, &co) != CO_RESULT_OK)
+        return NULL;
     return co;
 }
 
-co_result co_resume(coroutine *target)
+co_result co_resume(coroutine *target, void *input, void **output)
 {
     struct coroutine *caller;
 
+    if (output)
+        *output = NULL;
+
     ensure_initialized();
 
-    if (!target)                               return CO_RESULT_INVALID_ARGUMENT;
-    if (target->owner_token != &thread_token)  return CO_RESULT_WRONG_THREAD;
+    if (!target)                                    return CO_RESULT_INVALID_ARGUMENT;
+    if (target->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer())                              return CO_RESULT_INVALID_STATE;
+    if (current_coroutine && current_coroutine->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (target->defer_running)                      return CO_RESULT_INVALID_STATE;
     if (target->state == CO_RUNNING)           return CO_RESULT_ALREADY_RUNNING;
     if (target->state == CO_DONE)              return CO_RESULT_FINISHED;
-    if(target->state == CO_WAITING) return CO_RESULT_INVALID_STATE;
+    if (target->state == CO_WAITING)           return CO_RESULT_INVALID_STATE;
     if (target->state != CO_READY &&
         target->state != CO_SUSPENDED)         return CO_RESULT_INVALID_STATE;
 
@@ -101,50 +668,219 @@ co_result co_resume(coroutine *target)
     target->state     = CO_RUNNING;
     current_coroutine = target;
 
-    co_context_switch(&caller->context, &target->context);
+    void *got = co_exchange_and_switch(caller, target, input);
 
+    if (output)
+        *output = (target->state == CO_DONE) ? NULL : got;
     /* target yield 或結束後，控制流恢復 */
     current_coroutine = caller;
     caller->state     = CO_RUNNING;
     target->caller    = NULL;
+
     return CO_RESULT_OK;
 }
 
-co_result co_yield_now(void)
+co_result co_yield_now(void *output, void **next_input)
 {
-    struct coroutine *self = current_coroutine;
+    struct coroutine *self;
     struct coroutine *caller;
 
-    //確保回傳結果不產生錯誤的失敗訊號
+    if (next_input)
+        *next_input = NULL;
+
     ensure_initialized();
+    self = current_coroutine;
 
     if (!self)         return CO_RESULT_INVALID_STATE;
+    if (co_in_defer()) return CO_RESULT_INVALID_STATE;
+    if (self->defer_running) return CO_RESULT_INVALID_STATE;
     if (!self->caller) return CO_RESULT_NO_CALLER;
 
     caller            = self->caller;
-    self->state = CO_SUSPENDED;
+    self->state       = CO_SUSPENDED;
     current_coroutine = caller;
 
-    co_context_switch(&self->context, &caller->context);
+    void *got = co_exchange_and_switch(self, caller, output);
+    if (next_input)
+        *next_input = got;
 
     current_coroutine = self;
     self->state       = CO_RUNNING;
     return CO_RESULT_OK;
 }
 
+static void *co_exchange_and_switch(struct coroutine *from,
+                                    struct coroutine *to,
+                                    void *outgoing)
+{
+    void *incoming;
+
+    to->mailbox = outgoing;
+    co_do_switch(&from->context, &to->context, from, to);
+    incoming      = from->mailbox;
+    from->mailbox = NULL; /* mailbox = transient message */
+    return incoming;
+}
+
+coroutine *co_current(void)
+{
+    ensure_initialized();
+    return current_coroutine;
+}
+
+void *co_userdata(const coroutine *co)
+{
+    if (!co)
+        return NULL;
+    return co->userdata;
+}
+
+static const char co_cancel_sentinel;
+
+const void *const CO_CANCEL = &co_cancel_sentinel;
+
+int co_is_cancel(const void *msg)
+{
+    return msg == CO_CANCEL;
+}
+
+int co_cancel_requested(const coroutine *co)
+{
+    return co && co->cancelling;
+}
+
+#ifndef CO_DIAG_CANCEL
+#  define CO_DIAG_CANCEL 0
+#endif
+
+static void co_diag_cancel(const coroutine *co, int injected)
+{
+#if CO_DIAG_CANCEL
+    fprintf(stderr,
+            "coroutine: cancel ignored (%s): co=%p function=%p state=%d "
+            "stack=[%p,%p) total=%zu userdata=%p owner=%llu\n",
+            injected ? "callback yielded after sentinel"
+                     : "already requested, not re-injected",
+            (const void *)co, (void *)(uintptr_t)co->function, (int)co->state,
+            co->stack.lo, co->stack.hi, co->stack.total,
+            co->userdata, (unsigned long long)co->owner_id);
+    fflush(stderr);
+#else
+    (void)co; (void)injected;
+#endif
+}
+
+co_result co_cancel(coroutine *co)
+{
+    co_result r;
+
+    if (!co)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer() || co->defer_running)
+        return CO_RESULT_INVALID_STATE;
+
+    switch (co->state) {
+    case CO_READY:
+        co->cancelling = 1;
+        co->state = CO_DONE;
+        return CO_RESULT_CANCEL_NOT_STARTED;
+    case CO_DONE:
+        return CO_RESULT_OK;
+    case CO_RUNNING:
+        return CO_RESULT_ALREADY_RUNNING;
+    case CO_WAITING:
+        return CO_RESULT_INVALID_STATE;
+    case CO_SUSPENDED:
+        break;
+    default:
+        return CO_RESULT_INVALID_STATE;
+    }
+
+    if (co->cancelling) {
+        co_diag_cancel(co, /*injected=*/0);
+        return CO_RESULT_CANCEL_IGNORED;
+    }
+
+    co->cancelling = 1;
+    r = co_resume(co, (void *)CO_CANCEL, NULL);
+    if (r != CO_RESULT_OK)
+        return r;
+    if (co->state == CO_DONE)
+        return CO_RESULT_OK;
+    co_diag_cancel(co, /*injected=*/1);
+    return CO_RESULT_CANCEL_IGNORED;
+}
+
 co_result co_destroy(coroutine *co)
 {
-    if (!co)                                return CO_RESULT_INVALID_ARGUMENT;
-    //只有owner thread能釋放coroutine
-    if (co->owner_token != &thread_token)   return CO_RESULT_WRONG_THREAD;
-    if (co->state == CO_RUNNING)            return CO_RESULT_ALREADY_RUNNING;
-    /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
-    if (co->state == CO_SUSPENDED||
-        co->state == CO_WAITING)            return CO_RESULT_INVALID_STATE;
-    
-    co_stack_destroy(&co->stack);
-    free(co);
+    if (!co)                                    return CO_RESULT_INVALID_ARGUMENT;
+    /* 只有 owner thread 能釋放 coroutine */
+    if (co->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer() || co->defer_running)     return CO_RESULT_INVALID_STATE;
+    if (co->state == CO_RUNNING)                return CO_RESULT_ALREADY_RUNNING;
+    /* 掛起中禁止 destroy（無法 kill C stack）；強制回收請 co_abandon */
+    if (co->state == CO_SUSPENDED ||
+        co->state == CO_WAITING)                return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))               return CO_RESULT_INVALID_STATE;
+
+    co_release_owned(co);
     return CO_RESULT_OK;
+}
+
+co_result co_abandon(coroutine *co)
+{
+    if (!co)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer() || co->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (co->state == CO_RUNNING)
+        return CO_RESULT_ALREADY_RUNNING;
+    /* 巢狀鏈上的 WAITING 仍會被切回；丟堆疊會讓子協程 resume 進已釋放的 context */
+    if (co->state == CO_WAITING)
+        return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))
+        return CO_RESULT_INVALID_STATE;
+
+    /* READY / DONE / SUSPENDED：跑 defer 後釋放（不 resume） */
+    co_release_owned(co);
+    return CO_RESULT_OK;
+}
+
+co_result co_thread_shutdown(size_t *leaked_count)
+{
+    struct coroutine *co;
+    size_t leaked = 0;
+
+    ensure_initialized();
+
+    if (co_in_defer()) {
+        if (leaked_count)
+            *leaked_count = 0;
+        return CO_RESULT_INVALID_STATE;
+    }
+
+    co = g_live_head;
+    while (co) {
+        struct coroutine *next = co->live_next;
+
+        if (co->owner_id == co_self_thread_id()) {
+            if (co->state == CO_DONE || co->state == CO_READY) {
+                (void)co_destroy(co);
+            } else {
+                /* SUSPENDED / WAITING / RUNNING（含 cancel-ignored）：禁止 destroy */
+                leaked++;
+            }
+        }
+        co = next;
+    }
+
+    if (leaked_count)
+        *leaked_count = leaked;
+    return leaked ? CO_RESULT_INVALID_STATE : CO_RESULT_OK;
 }
 
 int co_finished(const coroutine *co)
@@ -166,4 +902,91 @@ size_t co_stack_peak(const coroutine *co)
     (void)co;
     return 0;
 #endif
+}
+
+co_result co_set_storage(coroutine *co, void *buf, size_t cap)
+{
+    if (!co) return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id()) return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer()) return CO_RESULT_INVALID_STATE;
+    if (co->state != CO_READY) return CO_RESULT_INVALID_STATE;
+    if (buf && cap == 0) return CO_RESULT_INVALID_ARGUMENT;
+    if (!buf && cap > 0) return CO_RESULT_INVALID_ARGUMENT;
+
+    co->storage_buffer = buf;
+    co->st_cap         = cap;
+    return CO_RESULT_OK;
+}
+
+void *co_storage(coroutine *co)
+{
+    if (!co || co->st_cap == 0) return NULL;
+    return co->storage_buffer;
+}
+
+size_t co_storage_size(coroutine *co)
+{
+    if (!co) return 0;
+    return co->st_cap;
+}
+
+co_result co_defer(coroutine *co, void (*fn)(void *), void *arg)
+{
+    co_result vr;
+
+    if (!co || !fn)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+
+    ensure_initialized();
+
+    vr = co_defer_validate_register(co);
+    if (vr != CO_RESULT_OK)
+        return vr;
+    if (co->defer_count >= CO_DEFER_SLOTS)
+        return CO_RESULT_OUT_OF_MEMORY; /* 未入表；呼叫端須自行清理 arg */
+
+    co->defer[co->defer_count].fn  = fn;
+    co->defer[co->defer_count].arg = arg;
+    co->defer_count++;
+    return CO_RESULT_OK;
+}
+
+co_result co_defer_cancel(coroutine *co, void (*fn)(void *), void *arg)
+{
+    unsigned i;
+    co_result vr;
+
+    if (!co || !fn)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+
+    ensure_initialized();
+
+    vr = co_defer_validate_register(co);
+    if (vr != CO_RESULT_OK)
+        return vr;
+
+    for (i = co->defer_count; i > 0; ) {
+        i--;
+        if (co->defer[i].fn == fn && co->defer[i].arg == arg) {
+            for (; i + 1 < co->defer_count; i++) {
+                co->defer[i] = co->defer[i + 1];
+            }
+            co->defer_count--;
+            co->defer[co->defer_count].fn  = NULL;
+            co->defer[co->defer_count].arg = NULL;
+            return CO_RESULT_OK;
+        }
+    }
+    return CO_RESULT_INVALID_ARGUMENT;
+}
+
+size_t co_defer_count(const coroutine *co)
+{
+    if (!co)
+        return 0;
+    return (size_t)co->defer_count;
 }

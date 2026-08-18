@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: P0 tests (debug)
+        run: make -f Makefile.p0 test
+      - name: P0 tests (NDEBUG)
+        run: make -f Makefile.p0 test-ndebug
+      - name: P1 tests
+        run: make -f Makefile.p1 test
