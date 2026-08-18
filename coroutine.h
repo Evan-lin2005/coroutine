@@ -46,7 +46,8 @@ typedef struct coroutine coroutine;
  * 禁止以 TLS 物件位址當 id）。主協程（TLS main）亦綁定該執行緒。
  *
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
- *   co_resume, co_destroy, co_cancel, co_set_storage, co_defer, co_defer_cancel
+ *   co_resume, co_destroy, co_abandon, co_cancel, co_set_storage, co_defer,
+ *   co_defer_cancel
  *
  * 執行緒結束契約：
  *   - Owner 結束前不得仍持有非 CO_DONE 的協程，除非已呼叫 co_thread_shutdown()
@@ -56,8 +57,9 @@ typedef struct coroutine coroutine;
  *   - orphan 警告僅計 CO_SUSPENDED／CO_WAITING／CO_RUNNING（與
  *     co_thread_shutdown 的 leaked_count 一致）；CO_DONE／CO_READY 靜默回收。
  *   - reclaim 後 coroutine* 失效（與 destroy 後 UAF 同類）。
- *   - 公開 co_destroy(SUSPENDED/WAITING/RUNNING) 仍回 INVALID_STATE，與 orphan
- *     reclaim 分路徑。
+ *   - 公開 co_destroy(SUSPENDED/WAITING/RUNNING) 仍回 INVALID_STATE。
+ *     掛起態的公開回收出口是 co_abandon（跑 defer 後釋放；不 resume）。
+ *     orphan reclaim 仍為 thread-exit 安全網，與 abandon 分路徑。
  *
  * co_yield_now — 必須在目標協程執行中呼叫（因此已在 owner thread）；
  *   在主協程或無 caller 時回 CO_RESULT_NO_CALLER / INVALID_STATE。
@@ -87,7 +89,8 @@ typedef struct coroutine coroutine;
  *   - callback 不可拋出 C++ 例外（本實作為 C，無法攔截）
  *   - callback 不可 longjmp 到協程外部的 jmp_buf
  *   - callback 內配置的資源必須在返回前自行釋放，或以 co_defer 登記清理（arg 不得指向協程堆疊）；
- *     C 沒有解構子，而掛起中的協程不允許銷毀（co_destroy）；提前放棄請 co_cancel 再到 co_destroy
+ *     C 沒有解構子。掛起中不可 co_destroy；提前放棄請 co_cancel 再到
+ *     co_destroy，或對 SUSPENDED 使用 co_abandon（跑 defer、丟凍結堆疊）
  *
  * 參數：
  *   - self           — 本協程（等同協程內 co_current()）
@@ -104,7 +107,7 @@ typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input
  * - AArch64 不保存 FPCR/FPSR（非 ABI callee-saved）；跨切換後 FP 環境暫存器可能改變，屬預期行為。
  *
  * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy /
- *   co_cancel。
+ *   co_abandon / co_cancel。
  */
 
 /*
@@ -175,11 +178,35 @@ co_result  co_yield_now(void *output, void **next_input);
 co_result  co_destroy(coroutine *co);
 
 /*
+ * co_abandon — 強制回收（公開銷毀出口；不 resume、不 unwind C stack）
+ * ----------------------------------------------------------------
+ * co_destroy 只接受 CO_READY／CO_DONE。掛起協程（含 cancel-ignored）的
+ * 公開回收是本函式：跑完已登記的 defer（LIFO、恰好一次），再釋放控制塊
+ * 與 mmap／VirtualAlloc 堆疊。與 orphan 安全網對齊，但是 owner 顯式呼叫。
+ *
+ * 凍結的協程框架隨 munmap 消失；未經 co_defer 登記的資源不回收。
+ * 不設 cancelling、不注入 CO_CANCEL、不把狀態推到 CO_DONE（指標直接失效）。
+ *
+ *   - CO_READY／CO_DONE／CO_SUSPENDED：OK
+ *   - CO_RUNNING：ALREADY_RUNNING（不可放棄正在執行的自己）
+ *   - CO_WAITING：INVALID_STATE（巢狀鏈上，子協程仍會切回此外層）
+ *   - TLS main：INVALID_STATE
+ *   - 非 owner：WRONG_THREAD
+ *   - defer 執行中：INVALID_STATE
+ *   - co == NULL：INVALID_ARGUMENT
+ *
+ * co_thread_shutdown 不自動 abandon；leaked 時由呼叫端逐一 abandon 或
+ * 先 cancel／resume 至完成。
+ */
+co_result  co_abandon(coroutine *co);
+
+/*
  * 合作式取消（co_cancel + CO_CANCEL sentinel）
  * ----------------------------------------------------------------
  * 對齊 Python GeneratorExit / Lua coroutine.close：取消是一次特殊的 resume，
  * 不是 kill、也不 unwind C stack。co_cancel 永不釋放控制塊／堆疊；
- * 回收一律 co_destroy。co_destroy(SUSPENDED/WAITING/RUNNING) 仍禁止。
+ * 回收走 co_destroy（READY／DONE）或 co_abandon（SUSPENDED）。
+ * co_destroy(SUSPENDED/WAITING/RUNNING) 仍禁止。
  *
  * CO_CANCEL — 庫提供的 mailbox sentinel（不可為 NULL；NULL 表示「無訊息」）。
  * co_is_cancel(msg) — msg == CO_CANCEL 時回非 0。
@@ -194,7 +221,9 @@ co_result  co_destroy(coroutine *co);
  *   - CO_RUNNING：ALREADY_RUNNING
  *   - CO_WAITING：INVALID_STATE（非 yield 點，無法注入）
  *   - 違約（看到 sentinel 後再 yield）：CANCEL_IGNORED；協程仍 SUSPENDED，
- *     cancelling 保留為 1（堆疊上可能有未釋放資源）
+ *     cancelling 保留為 1。此時 co_destroy 仍 INVALID_STATE；公開回收用
+ *     co_abandon（跑 defer、丟凍結堆疊），或手動 co_resume(CO_CANCEL) 守約
+ *     return 後再 co_destroy。
  *   - 再次 co_cancel 且 cancelling 已為 1：不再注入 sentinel，回 CANCEL_IGNORED。
  *     診斷列印僅在以 -DCO_DIAG_CANCEL=1 編譯時；不因 NDEBUG 改變語意、不 abort。
  *
@@ -220,7 +249,7 @@ co_result co_cancel(coroutine *co);
 /*
  * Defer 契約（登記清理，使資源指標脫離協程堆疊）
  * ----------------------------------------------------------------
- * 三動詞：co_cancel 只送請求；co_defer 只登記；co_destroy 回收庫資源並跑未執行的 defer。
+ * 三動詞：co_cancel 只送請求；co_defer 只登記；co_destroy／co_abandon 回收庫資源並跑未執行的 defer。
  *
  * 允許登記者：
  *   - 協程自身（co == co_current()，執行中）
@@ -229,15 +258,15 @@ co_result co_cancel(coroutine *co);
  *
  * 執行點（LIFO、恰好一次、執行後 defer_count == 0）：
  *   1. trampoline — callback 返回後、CO_DONE 前（含守約 cancel）
- *   2. co_destroy — unlink 後、co_stack_destroy 前
+ *   2. co_destroy／co_abandon — unlink 後、co_stack_destroy 前
  *   3. orphan 安全網 — 同 destroy 順序（thread exit / atexit）
- * co_cancel 違約（CANCEL_IGNORED）不跑 defer；thread-exit 才補跑。
+ * co_cancel 違約（CANCEL_IGNORED）不跑 defer；co_abandon 或 thread-exit 才補跑。
  *
  * 槽滿回 CO_RESULT_OUT_OF_MEMORY：fn/arg 未入表，呼叫端仍持有 arg，須自行清理
  * （失敗路徑不會呼叫 fn）。
  *
- * fn 限制：不得 co_yield_now / co_resume / co_destroy / co_thread_shutdown /
- * co_cls_set；arg 不得指向協程堆疊區域變數
+ * fn 限制：不得 co_yield_now / co_resume / co_destroy / co_abandon /
+ * co_thread_shutdown / co_cls_set；arg 不得指向協程堆疊區域變數
  * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
  * defer 執行期間以執行緒 TLS 計數守衛（三個執行點皆算，不依賴 current==co）；
  * mutating API 回 INVALID_STATE。
@@ -252,6 +281,7 @@ co_result co_cancel(coroutine *co);
  *   if (co_defer(self, free, buf) != CO_RESULT_OK) { free(buf); return; }
  *   co_defer(co, destroy_ctx, ctx);  // CO_READY 預登
  *   if (co_cancel(co) == CO_RESULT_CANCEL_NOT_STARTED) co_destroy(co);
+ *   if (co_cancel(co) == CO_RESULT_CANCEL_IGNORED)     co_abandon(co);
  */
 co_result co_defer(coroutine *co, void (*fn)(void *), void *arg);
 co_result co_defer_cancel(coroutine *co, void (*fn)(void *), void *arg);
@@ -268,7 +298,8 @@ size_t    co_defer_count(const coroutine *co);
  * 回傳：
  *   - CO_RESULT_OK — 名下協程已全部乾淨釋放（*leaked_count == 0）
  *   - CO_RESULT_INVALID_STATE — 仍有無法 destroy 的協程（*leaked_count > 0）；
- *     caller 應先 co_cancel 或 resume 至完成再結束執行緒，而非直接 exit
+ *     caller 應先 co_cancel、co_abandon（僅 SUSPENDED）或 resume 至完成
+ *     再結束執行緒，而非直接 exit
  *
  * leaked_count 可為 NULL（仍回傳上述結果碼）。
  * 不 reclaim 掛起中協程（那是 thread-exit 安全網的路徑）。
@@ -328,8 +359,8 @@ void      *co_userdata(const coroutine *co);
  *   - 跨 thread 並行讀寫 buffer 內容（或與 set_storage / resume 並行）為 UB。
  *
  * 生命週期：
- *   - buf 須在協程仍可能存取 storage 期間有效（至少至 co_destroy 完成後才可釋放）。
- *   - co_destroy 不觸碰 buf；與外部 stack 策略一致，buffer 由呼叫端負責保護與釋放。
+ *   - buf 須在協程仍可能存取 storage 期間有效（至少至 co_destroy／co_abandon 完成後才可釋放）。
+ *   - co_destroy／co_abandon 不觸碰 buf；與外部 stack 策略一致，buffer 由呼叫端負責保護與釋放。
  *   - 協程掛起期間若呼叫端已釋放 buf 而協程仍持有指標 → UB。
  *   - 對齊、struct layout、是否含指標由呼叫端負責；預設不配置，避免庫內隱式 heap。
  */
@@ -413,7 +444,8 @@ void      *co_cls_get(co_cls_key key);
  *   - 高頻 co_create/co_destroy 時，自訂 allocator 可讓控制塊走 arena/pool，
  *     而不必讓每次 libc calloc/free。
  *
- * 流程：co_set_allocator(&a) → co_create / co_destroy（建議在首次 co_create 前設定）。
+ *   - 流程：co_set_allocator(&a) → co_create / co_destroy / co_abandon
+ *     （建議在首次 co_create 前設定）。
  *
  *
  * co_allocator：
@@ -434,7 +466,7 @@ void      *co_cls_get(co_cls_key key);
  *
  * Allocator snapshot（避免 alloc/free mismatch）：
  *   - 每條協程在 co_create_ex 成功配置控制塊時，將當時的 g_allocator 快照進物件。
- *   - co_destroy（以及 create 失敗回滾）一律用該快照釋放，不讀當前 g_allocator。
+ *   - co_destroy／co_abandon（以及 create 失敗回滾）一律用該快照釋放，不讀當前 g_allocator。
  *   - 因此「先 create、再 co_set_allocator 換成另一套、再 destroy」仍會用原 allocator 的 free，
  *     不會把自訂區塊誤丟給 libc free（或反之）。
  *   - 仍建議在尚未有活協程時設定策略；中途更換只影響之後新建立的協程。

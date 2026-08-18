@@ -153,6 +153,7 @@ static uint64_t co_self_thread_id(void)
 static void ensure_initialized(void);
 static void co_live_unlink(struct coroutine *co);
 static void co_run_defers(struct coroutine *co);
+static void co_release_owned(struct coroutine *co);
 static void co_internal_reclaim_orphan(struct coroutine *co);
 
 /* ------------------------------------------------------------------ *
@@ -409,7 +410,18 @@ static void co_run_defers(struct coroutine *co)
     tls_defer_running--;
 }
 
-/* 僅釋放庫資源；不 resume、不跑 callback、不經公開 co_destroy 狀態檢查 */
+/* 已通過合法性檢查：unlink → defer → 釋放堆疊與控制塊；之後指標失效 */
+static void co_release_owned(struct coroutine *co)
+{
+    co_allocator snap = co->allocator;
+
+    co_live_unlink(co);
+    co_run_defers(co);
+    co_stack_destroy(&co->stack);
+    co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
+    co_mem_free_with(&snap, co, sizeof *co);
+}
+
 static int co_frame_on_stack(const struct co_stack *st, const void *sp)
 {
     if (!st || !st->lo || !st->hi || !sp)
@@ -420,6 +432,7 @@ static int co_frame_on_stack(const struct co_stack *st, const void *sp)
 
 static void co_internal_reclaim_orphan(struct coroutine *co)
 {
+    /* 不 resume、不經公開 destroy 狀態檢查；可能略過 munmap（見下） */
     co_allocator snap;
     void *sp;
 
@@ -807,18 +820,33 @@ co_result co_destroy(coroutine *co)
     if (co->owner_id != co_self_thread_id())    return CO_RESULT_WRONG_THREAD;
     if (co_in_defer() || co->defer_running)     return CO_RESULT_INVALID_STATE;
     if (co->state == CO_RUNNING)                return CO_RESULT_ALREADY_RUNNING;
-    /* 掛起中的協程堆疊上可能有未釋放的資源；採「禁止銷毀」語意（無法 kill 一條 coroutine） */
+    /* 掛起中禁止 destroy（無法 kill C stack）；強制回收請 co_abandon */
     if (co->state == CO_SUSPENDED ||
         co->state == CO_WAITING)                return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))               return CO_RESULT_INVALID_STATE;
 
-    {
-        co_allocator snap = co->allocator;
-        co_live_unlink(co);
-        co_run_defers(co);
-        co_stack_destroy(&co->stack);
-        co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
-        co_mem_free_with(&snap, co, sizeof *co);
-    }
+    co_release_owned(co);
+    return CO_RESULT_OK;
+}
+
+co_result co_abandon(coroutine *co)
+{
+    if (!co)
+        return CO_RESULT_INVALID_ARGUMENT;
+    if (co->owner_id != co_self_thread_id())
+        return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer() || co->defer_running)
+        return CO_RESULT_INVALID_STATE;
+    if (co->state == CO_RUNNING)
+        return CO_RESULT_ALREADY_RUNNING;
+    /* 巢狀鏈上的 WAITING 仍會被切回；丟堆疊會讓子協程 resume 進已釋放的 context */
+    if (co->state == CO_WAITING)
+        return CO_RESULT_INVALID_STATE;
+    if (co_is_main_coroutine(co))
+        return CO_RESULT_INVALID_STATE;
+
+    /* READY / DONE / SUSPENDED：跑 defer 後釋放（不 resume） */
+    co_release_owned(co);
     return CO_RESULT_OK;
 }
 
