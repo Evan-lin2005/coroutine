@@ -134,6 +134,7 @@ static unsigned long long g_thread_serial; /* accessed via __atomic_* */
 static CO_THREAD_LOCAL uint64_t          thread_id; /* 0 = 尚未配置 */
 static CO_THREAD_LOCAL struct coroutine  main_coroutine;
 static CO_THREAD_LOCAL struct coroutine *current_coroutine;
+static CO_THREAD_LOCAL struct coroutine *g_transfer_from; /* 上次切出方；供 transfer prev / ASan */
 static CO_THREAD_LOCAL struct coroutine *g_live_head; /* per-thread 雙向鏈頭 */
 static CO_THREAD_LOCAL int               tls_defer_running;
 
@@ -301,7 +302,30 @@ static void ensure_initialized(void)
 
 static void *co_exchange_and_switch(struct coroutine *from,
                                     struct coroutine *to,
-                                    void *outgoing);
+                                    void *outgoing)
+{
+    void *incoming;
+
+    to->mailbox = outgoing;
+    co_do_switch(&from->context, &to->context, from, to);
+    incoming      = from->mailbox;
+    from->mailbox = NULL; /* mailbox = transient message */
+    return incoming;
+}
+
+static co_transfer_t co_transfer_switch(struct coroutine *from,
+                                        struct coroutine *to,
+                                        void *outgoing)
+{
+    co_transfer_t t;
+
+    g_transfer_from   = from;
+    current_coroutine = to;
+    t.data            = co_exchange_and_switch(from, to, outgoing);
+    t.prev            = g_transfer_from;
+    current_coroutine = from;
+    return t;
+}
 
 /* ------------------------------------------------------------------ *
  * allocator — 僅 struct coroutine；g_allocator 為 co_set_allocator 的副本
@@ -563,26 +587,27 @@ void *co_cls_get(co_cls_key key)
 void co_trampoline_body(void)
 {
     struct coroutine *self = current_coroutine;
-    struct coroutine *caller;
+    struct coroutine *sink;
     void             *initial_input;
 
-    /* P0：首次進入 fiber 時 finish 來自 caller 的 start_switch 狀態 */
-    co_asan_finish_on_enter(self->caller);
+    /* P0：首次進入 fiber 時 finish 來自實際切出方的 start_switch 狀態 */
+    co_asan_finish_on_enter(g_transfer_from);
 
-    /* 首次 resume 的 input：消費 mailbox 後交給 callback */
+    /* 首次 resume／transfer 的 input：消費 mailbox 後交給 callback */
     initial_input   = self->mailbox;
     self->mailbox   = NULL;
     self->function(self, self->userdata, initial_input); /* 契約見標頭 */
 
     co_run_defers(self);
-    self->state       = CO_DONE;
-    caller            = self->caller;
-    current_coroutine = caller;
+    self->state = CO_DONE;
 
-    /* 正常結束：無 output；避免 co_resume 讀到過期 mailbox */
-    caller->mailbox = NULL;
+    sink = self->caller;
+    if (!sink)
+        sink = &main_coroutine;
+    if (sink == self)
+        abort();
 
-    co_do_switch(&self->context, &caller->context, self, caller);
+    (void)co_transfer_switch(self, sink, NULL);
     abort();    /* 已完成的協程不該被再次進入 */
 }
 
@@ -644,6 +669,7 @@ coroutine *co_create(size_t stack_size, co_function function, void *userdata)
 co_result co_resume(coroutine *target, void *input, void **output)
 {
     struct coroutine *caller;
+    co_transfer_t     t;
 
     if (output)
         *output = NULL;
@@ -666,14 +692,11 @@ co_result co_resume(coroutine *target, void *input, void **output)
     caller->state     = CO_WAITING;
     target->caller    = caller;
     target->state     = CO_RUNNING;
-    current_coroutine = target;
 
-    void *got = co_exchange_and_switch(caller, target, input);
+    t = co_transfer_switch(caller, target, input);
 
     if (output)
-        *output = (target->state == CO_DONE) ? NULL : got;
-    /* target yield 或結束後，控制流恢復 */
-    current_coroutine = caller;
+        *output = (target->state == CO_DONE) ? NULL : t.data;
     caller->state     = CO_RUNNING;
     target->caller    = NULL;
 
@@ -684,6 +707,7 @@ co_result co_yield_now(void *output, void **next_input)
 {
     struct coroutine *self;
     struct coroutine *caller;
+    co_transfer_t     t;
 
     if (next_input)
         *next_input = NULL;
@@ -696,30 +720,52 @@ co_result co_yield_now(void *output, void **next_input)
     if (self->defer_running) return CO_RESULT_INVALID_STATE;
     if (!self->caller) return CO_RESULT_NO_CALLER;
 
-    caller            = self->caller;
-    self->state       = CO_SUSPENDED;
-    current_coroutine = caller;
+    caller      = self->caller;
+    self->state = CO_SUSPENDED;
 
-    void *got = co_exchange_and_switch(self, caller, output);
+    t = co_transfer_switch(self, caller, output);
     if (next_input)
-        *next_input = got;
+        *next_input = t.data;
 
-    current_coroutine = self;
-    self->state       = CO_RUNNING;
+    self->state = CO_RUNNING;
     return CO_RESULT_OK;
 }
 
-static void *co_exchange_and_switch(struct coroutine *from,
-                                    struct coroutine *to,
-                                    void *outgoing)
+co_result co_transfer(coroutine *to, void *data, co_transfer_t *out)
 {
-    void *incoming;
+    struct coroutine *from;
+    co_transfer_t     t;
 
-    to->mailbox = outgoing;
-    co_do_switch(&from->context, &to->context, from, to);
-    incoming      = from->mailbox;
-    from->mailbox = NULL; /* mailbox = transient message */
-    return incoming;
+    if (out) {
+        out->prev = NULL;
+        out->data = NULL;
+    }
+
+    ensure_initialized();
+    from = current_coroutine;
+
+    if (!to)                                     return CO_RESULT_INVALID_ARGUMENT;
+    if (!from)                                   return CO_RESULT_INVALID_STATE;
+    if (to->owner_id != co_self_thread_id())     return CO_RESULT_WRONG_THREAD;
+    if (co_in_defer())                           return CO_RESULT_INVALID_STATE;
+    if (from->defer_running)                     return CO_RESULT_INVALID_STATE;
+    if (to->defer_running)                       return CO_RESULT_INVALID_STATE;
+    if (to == from || to->state == CO_RUNNING)   return CO_RESULT_ALREADY_RUNNING;
+    if (to->state == CO_DONE)                    return CO_RESULT_FINISHED;
+    if (to->state != CO_READY &&
+        to->state != CO_SUSPENDED &&
+        to->state != CO_WAITING)
+        return CO_RESULT_INVALID_STATE;
+
+    from->state = CO_SUSPENDED;
+    to->state   = CO_RUNNING;
+
+    t = co_transfer_switch(from, to, data);
+
+    from->state = CO_RUNNING;
+    if (out)
+        *out = t;
+    return CO_RESULT_OK;
 }
 
 coroutine *co_current(void)

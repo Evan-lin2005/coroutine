@@ -35,6 +35,31 @@ void test_cancel_running(void);
 void test_cancel_waiting(void);
 void test_cancel_null(void);
 void test_cancel_wrong_thread(void);
+void test_defer_lifo(void);
+void test_defer_exactly_once(void);
+void test_defer_ready_cancel(void);
+void test_defer_cancel_ignored(void);
+void test_defer_slots_full(void);
+void test_defer_cancel_middle(void);
+void test_defer_reject_register(void);
+void test_defer_running_blocks_yield(void);
+void test_defer_destroy_ctx_mismatch(void);
+void test_defer_orphan_reclaim(void);
+void test_defer_main_atexit(void);
+void test_defer_asan_uar_destroy(void);
+void test_abandon_null(void);
+void test_abandon_ready(void);
+void test_abandon_done(void);
+void test_abandon_suspended(void);
+void test_abandon_cancel_ignored(void);
+void test_abandon_running(void);
+void test_abandon_waiting(void);
+void test_abandon_during_defer(void);
+void test_abandon_wrong_thread(void);
+void test_shutdown_stress_non_done(void);
+void test_shutdown_from_fiber_non_done(void);
+void test_defer_second_run_stress(void);
+void test_defer_oom_residual_stress(void);
 
 static void run_one(const char *name, void (*fn)(void))
 {
@@ -77,6 +102,49 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--cancel-waiting") == 0) run_all = 0, run_one("cancel-waiting", test_cancel_waiting);
         if (strcmp(argv[i], "--cancel-null") == 0)  run_all = 0, run_one("cancel-null", test_cancel_null);
         if (strcmp(argv[i], "--cancel-wrong") == 0) run_all = 0, run_one("cancel-wrong", test_cancel_wrong_thread);
+        if (strcmp(argv[i], "--defer-lifo") == 0)   run_all = 0, run_one("defer-lifo", test_defer_lifo);
+        if (strcmp(argv[i], "--defer-once") == 0)   run_all = 0, run_one("defer-once", test_defer_exactly_once);
+        if (strcmp(argv[i], "--defer-ready") == 0)  run_all = 0, run_one("defer-ready", test_defer_ready_cancel);
+        if (strcmp(argv[i], "--defer-ignore") == 0) run_all = 0, run_one("defer-ignore", test_defer_cancel_ignored);
+        if (strcmp(argv[i], "--defer-slots") == 0)  run_all = 0, run_one("defer-slots", test_defer_slots_full);
+        if (strcmp(argv[i], "--defer-cancel") == 0) run_all = 0, run_one("defer-cancel", test_defer_cancel_middle);
+        if (strcmp(argv[i], "--defer-reject") == 0) run_all = 0, run_one("defer-reject", test_defer_reject_register);
+        if (strcmp(argv[i], "--defer-yield") == 0)  run_all = 0, run_one("defer-yield", test_defer_running_blocks_yield);
+        if (strcmp(argv[i], "--defer-destroy-ctx") == 0)
+            run_all = 0, run_one("defer-destroy-ctx", test_defer_destroy_ctx_mismatch);
+        if (strcmp(argv[i], "--defer-orphan") == 0) run_all = 0, run_one("defer-orphan", test_defer_orphan_reclaim);
+        if (strcmp(argv[i], "--defer-atexit") == 0) run_all = 0, run_one("defer-atexit", test_defer_main_atexit);
+        if (strcmp(argv[i], "--defer-asan-uar") == 0)
+            run_all = 0, run_one("defer-asan-uar", test_defer_asan_uar_destroy);
+        if (strcmp(argv[i], "--abandon") == 0) {
+            run_all = 0;
+            run_one("abandon-null", test_abandon_null);
+            run_one("abandon-ready", test_abandon_ready);
+            run_one("abandon-done", test_abandon_done);
+            run_one("abandon-suspended", test_abandon_suspended);
+            run_one("abandon-cancel-ignored", test_abandon_cancel_ignored);
+            run_one("abandon-running", test_abandon_running);
+            run_one("abandon-waiting", test_abandon_waiting);
+            run_one("abandon-during-defer", test_abandon_during_defer);
+            run_one("abandon-wrong-thread", test_abandon_wrong_thread);
+        }
+        if (strcmp(argv[i], "--shutdown-stress") == 0)
+            run_all = 0, run_one("shutdown-stress", test_shutdown_stress_non_done);
+        if (strcmp(argv[i], "--shutdown-fiber") == 0)
+            run_all = 0, run_one("shutdown-fiber",
+                                 test_shutdown_from_fiber_non_done);
+        if (strcmp(argv[i], "--defer-second-run") == 0)
+            run_all = 0, run_one("defer-second-run", test_defer_second_run_stress);
+        if (strcmp(argv[i], "--defer-oom-residual") == 0)
+            run_all = 0, run_one("defer-oom-residual",
+                                 test_defer_oom_residual_stress);
+        if (strcmp(argv[i], "--defer-stress") == 0) {
+            run_all = 0;
+            run_one("shutdown-stress", test_shutdown_stress_non_done);
+            run_one("shutdown-fiber", test_shutdown_from_fiber_non_done);
+            run_one("defer-second-run", test_defer_second_run_stress);
+            run_one("defer-oom-residual", test_defer_oom_residual_stress);
+        }
     }
 
     if (run_all) {
@@ -103,6 +171,31 @@ int main(int argc, char **argv)
         run_one("cancel-waiting", test_cancel_waiting);
         run_one("cancel-null", test_cancel_null);
         run_one("cancel-wrong-thread", test_cancel_wrong_thread);
+        run_one("defer-lifo", test_defer_lifo);
+        run_one("defer-once", test_defer_exactly_once);
+        run_one("defer-ready-cancel", test_defer_ready_cancel);
+        run_one("defer-cancel-ignored", test_defer_cancel_ignored);
+        run_one("defer-slots-full", test_defer_slots_full);
+        run_one("defer-cancel-middle", test_defer_cancel_middle);
+        run_one("defer-reject-register", test_defer_reject_register);
+        run_one("defer-running-blocks-yield", test_defer_running_blocks_yield);
+        run_one("defer-destroy-ctx", test_defer_destroy_ctx_mismatch);
+        run_one("defer-orphan-reclaim", test_defer_orphan_reclaim);
+        run_one("defer-main-atexit", test_defer_main_atexit);
+        run_one("defer-asan-uar", test_defer_asan_uar_destroy);
+        run_one("abandon-null", test_abandon_null);
+        run_one("abandon-ready", test_abandon_ready);
+        run_one("abandon-done", test_abandon_done);
+        run_one("abandon-suspended", test_abandon_suspended);
+        run_one("abandon-cancel-ignored", test_abandon_cancel_ignored);
+        run_one("abandon-running", test_abandon_running);
+        run_one("abandon-waiting", test_abandon_waiting);
+        run_one("abandon-during-defer", test_abandon_during_defer);
+        run_one("abandon-wrong-thread", test_abandon_wrong_thread);
+        run_one("shutdown-stress", test_shutdown_stress_non_done);
+        run_one("shutdown-fiber", test_shutdown_from_fiber_non_done);
+        run_one("defer-second-run", test_defer_second_run_stress);
+        run_one("defer-oom-residual", test_defer_oom_residual_stress);
         run_one("mass", test_mass_lifecycle);
     }
 
