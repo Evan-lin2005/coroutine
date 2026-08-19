@@ -226,6 +226,9 @@ co_result  co_destroy(coroutine *co);
  *   - CO_READY／CO_DONE／CO_SUSPENDED：OK
  *   - CO_RUNNING：ALREADY_RUNNING（不可放棄正在執行的自己）
  *   - CO_WAITING：INVALID_STATE（巢狀鏈上，子協程仍會切回此外層）
+ *   - 仍是某條 WAITING 的 resume_target（外層 co_resume(co) 尚未返回）：
+ *     INVALID_STATE。SUSPENDED 不夠：A transfer 走後仍可能是 main 那次 resume 的
+ *     target；abandon 後 waiter 被喚醒會 UAF。須等該次 resume 返回再回收。
  *   - TLS main：INVALID_STATE
  *   - 非 owner：WRONG_THREAD
  *   - defer 執行中：INVALID_STATE

@@ -921,6 +921,11 @@ co_result co_abandon(coroutine *co)
     /* 巢狀鏈上的 WAITING 仍會被切回；丟堆疊會讓子協程 resume 進已釋放的 context */
     if (co->state == CO_WAITING)
         return CO_RESULT_INVALID_STATE;
+    /* 外層仍停在 co_resume(co)：其 stack 上的 target 指向本協程。
+     * 此時 abandon 會讓 waiter 被喚醒時 UAF（SUSPENDED 仍可能是 in-flight resume 的 target）。 */
+    if (co->caller && co->caller->state == CO_WAITING &&
+        co->caller->resume_target == co)
+        return CO_RESULT_INVALID_STATE;
     if (co_is_main_coroutine(co))
         return CO_RESULT_INVALID_STATE;
 
