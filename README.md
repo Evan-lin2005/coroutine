@@ -12,15 +12,16 @@
 | **P1** 嵌入鉤子 | mailbox 傳值、custom allocator、storage、`co_current`、CLS | **完成** |
 | **D-1..D-7** | `owner_id`、orphan shutdown、stack bounds、opt-in crash handler、ASan bounds/fake_stack、atomic `page_size`、非淘汰 guard 表 | **完成** |
 | **D-9** 合作式取消 | `co_cancel` + `CO_CANCEL` sentinel；`CANCEL_IGNORED` | **完成** |
-| **P2** 對稱原語 | `co_transfer`；resume/yield 建其上；TSan fiber；外部 stack 公開決策 | 待做 |
+| **P2** 對稱原語 | `co_transfer`；resume/yield 建其上；拒絕巢狀 WAITING steal／in-flight abandon | **完成** |
 | **P3** 密度 | stack pool → shared copy-stack | 待做 |
 
-公開 API 為非對稱 `co_resume` / `co_yield_now`（mailbox 傳值）、可選 storage、CLS、`co_current`、custom allocator、`co_thread_shutdown`、opt-in crash handler。P0/P1 與 D-1..D-7 契約已補齊回歸測試。
+公開 API 為非對稱 `co_resume` / `co_yield_now`（mailbox 傳值）、對稱 `co_transfer`、可選 storage、CLS、`co_current`、custom allocator、`co_thread_shutdown`、opt-in crash handler。P0/P1/P2 與 D-1..D-7 契約已補齊回歸測試。
 
 ## 功能摘要
 
 - **合作式取消**：`co_cancel` 只把協程推到 `CO_DONE`（READY 回 `CANCEL_NOT_STARTED`），回收一律 `co_destroy`。違約 yield → `CANCEL_IGNORED`；再次 `co_cancel` 不注入 sentinel。查詢用 `co_cancel_requested`
-- **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)`
+- **對稱切換**：`co_transfer(to, data, out)` 兄弟 hop；不可偷走仍有內層 `WAITING` 的外層 resume；不可 abandon 尚未返回的 resume target
+- **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)` / `co_transfer` 共用同一信箱
 - **CLS**：`co_cls_alloc` / `co_cls_set` / `co_cls_get`（process-global key、per-coroutine value）
 - **可選 storage**：`co_set_storage` / `co_storage`（呼叫端自有 buffer）
 - **Custom allocator**：`co_set_allocator`（控制塊配置；create 時快照）
@@ -146,6 +147,7 @@ co_context.h                  平台 context 聚合
 platform/                     各架構 asm + stack 實作
 tests/p0/                     P0 正確性測與 bench_switch
 tests/p1/                     P1 mailbox / storage / allocator / CLS
+tests/p2/                     P2 co_transfer 正確性測與 hop bench
 test_coroutine.c              基本功能 / 壓力測
 Plan.md                       路線圖（P0–P3 + D-1..D-7）
 ```
@@ -159,6 +161,8 @@ Plan.md                       路線圖（P0–P3 + D-1..D-7）
 | `make -f Makefile.p0 bench` | 空切換 throughput / cycles/switch |
 | `make p0-asan` | ASan build 跑 P0（`test_regs` 在 ASan 下會 SKIP，其餘應通過） |
 | `make -f Makefile.p1 test` | P1 mailbox、storage、allocator、CLS（含 `--cls-alloc-race` 獨立 process） |
+| `make -f Makefile.p2 test` | P2 `co_transfer` sibling hop、WAITING steal、in-flight abandon |
+| `make -f Makefile.p2 bench` | hop 對照：`main_yield`／`sched_main`／`nested_resume`／`transfer` |
 
 P0 可單獨跑：
 
@@ -173,8 +177,9 @@ P0 可單獨跑：
 1. **P0（已完成）** — 切換與堆疊契約有可回歸證據
 2. **P1（已完成）** — mailbox 傳值、allocator、storage、`co_current`、CLS
 3. **D-1..D-7（已完成）** — owner／shutdown、stack bounds、opt-in handler、ASan、page_size、guard 表
-4. **P2** — `co_transfer` 為底層；TSan fiber；鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
-5. **P3** — stack pool，再可選 shared copy-stack（禁巢狀、高風險）
+4. **P2（已完成）** — `co_transfer` 為底層；拒絕巢狀 WAITING steal 與 in-flight abandon
+5. **P2 後續** — TSan fiber；鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
+6. **P3** — stack pool，再可選 shared copy-stack（禁巢狀、高風險）
 
 ### 刻意不做
 

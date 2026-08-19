@@ -15,8 +15,8 @@ todos:
     content: D-9：co_cancel + CO_CANCEL sentinel、CANCEL_IGNORED
     status: completed
   - id: p2-transfer
-    content: P2：以 C 層 co_transfer 為原語，非對稱 resume/yield 建其上
-    status: pending
+    content: P2：以 C 層 co_transfer 為原語，非對稱 resume/yield 建其上；拒絕巢狀 WAITING steal 與 in-flight abandon
+    status: completed
   - id: p3-density
     content: P3：stack pool 回收，再實作 shared copy-stack（禁巢狀）與密度 benchmark
     status: pending
@@ -207,9 +207,9 @@ void *co_cls_get(int key);
 
 ---
 
-## P2 — 對稱切換為底層原語
+## P2 — 對稱切換為底層原語（已落地）
 
-目標：Boost.context 模型；非對稱 API 建在上面。
+目標：Boost.context 模型；公開非對稱 API 建在 `co_transfer` 上。asm 不變。
 
 ### `co_transfer`
 
@@ -219,19 +219,42 @@ typedef struct co_transfer_t {
     void      *data;
 } co_transfer_t;
 
-co_transfer_t co_transfer(coroutine *to, void *data);
+co_result co_transfer(coroutine *to, void *data, co_transfer_t *out);
 ```
 
-- **C 層實作（首選）**：`data` 走 `transfer` 欄位；asm 維持 `void co_context_switch(from,to)`，不改四平台 `.S`。
-- 狀態機：`to` 可為任意 `SUSPENDED`/`READY`；清除嚴格「只能 yield 回 caller」的底層限制；`caller` 改為非對稱包裝維護。
-- 非對稱改寫：
-  - `co_resume` = 設 caller + `co_transfer(target, arg)`，回來後清 caller
-  - `co_yield_now` = `co_transfer(self->caller, arg)`
-- `CO_WAITING`：巢狀 resume 時仍標記外層，防止對同一協程重入；對稱排程器若自管，可不使用 `co_resume`。
+- **C 層實作**：`data` 走既有 mailbox（讀後清空）；`prev` 走 TLS `g_transfer_from`，不是 struct 欄位。不改四平台 `.S`。
+- `co_resume`／`co_yield_now` 建在內部 `co_transfer_switch` 上；公開非對稱契約不變。`co_transfer` **不**改 caller 鏈、不把 from 標成 `CO_WAITING`。
+- 目標狀態：`READY`／`SUSPENDED`／`WAITING` 允許（WAITING 用於喚醒停在 resume／transfer 的對方）；`RUNNING`（含 `to == self`）→ `ALREADY_RUNNING`；`DONE` → `FINISHED`。
+- trampoline 無 caller 時切回 TLS main。首次進入：`initial_input` 為第一次 resume／transfer 的 mailbox；`userdata` 不經 mailbox。
 
-首次進入 trampoline：模擬一次「來自 creator 的 transfer」，`data` 為 create 時的 `argument`（或 resume 傳入的第一個值——與 Lua 對齊：**第一次 resume 的 arg 當入口參數**，`co_create` 的 argument 可保留為 userdata）。
+### 巢狀 WAITING steal（已落地）
 
-### TSan fiber annotations（佔位）
+`P resume(A)` → `A resume(B)` 時，P 停在 `co_resume(A)` 且 `A->state == WAITING`。若 B（或第三者）`co_transfer(P)`，P 的 resume 會先返回，A 永遠卡在內層 `WAITING`：無法 destroy／abandon／cancel／再 resume。C 無法 unwind，只能預防。
+
+- `struct coroutine` 加 `resume_target`：`co_resume` 進入時設在 waiter 上，返回時清掉。
+- 公開 `co_transfer`：若 `to` 為 `WAITING` 且 `to->resume_target->state == WAITING` → `CO_RESULT_INVALID_STATE`。兄弟 hop 不受影響（對方 resume target 是 `SUSPENDED`）。`co_yield_now` 仍 hop 到直接 caller。
+- trampoline 結束路徑沒有錯誤碼：若 sink 會 strand（或 `sink == self`），**一律** `fprintf` + `fflush` + `abort()`（非 opt-in、不隨 `NDEBUG` 消失）。訊息提示先 yield／transfer 回直接 caller。
+
+### in-flight resume 的 `co_abandon`（已落地）
+
+`main resume(A)` → A `transfer(B)` 後 A 是 `SUSPENDED`，但 main 仍停在 `co_resume(A)`，stack 上的 `target` 指向 A。此時 `co_abandon(A)` 會讓 waiter 被喚醒時 UAF。`co_destroy` 本來就拒絕 `SUSPENDED`，洞只在 abandon。
+
+```c
+if (co->caller && co->caller->state == CO_WAITING &&
+    co->caller->resume_target == co)
+    return CO_RESULT_INVALID_STATE;
+```
+
+純 transfer 啟動、`caller == NULL` 的 fiber 不受影響。該次 resume 返回後 `caller`／`resume_target` 已清，abandon 合法。
+
+**不改變**：`co_transfer` 不清 `from->caller`（否則無法 yield 回當初的 resume caller）。
+
+### 測試與 bench
+
+- `make -f Makefile.p2 test`：`tests/p2/test_co_transfer.c` — sibling-hop、abandon-inflight、first-entry、no-caller-yield、transfer-waiting、nested-steal、indirect-steal、rejects、wrong-thread。
+- `make -f Makefile.p2 bench`：`tests/p2/bench_hop.c` — `main_yield`／`sched_main`／`nested_resume`／`transfer` hop 對照。兄弟 `co_transfer` 比「main 當 dispatcher」快；單 fiber `resume`／`yield` 路徑不因此加速。
+
+### TSan fiber annotations（後續，本迭代不做）
 
 當存在 `co_transfer`／跨 fiber 排程器時，需在 create／switch／destroy 接上：
 
@@ -239,16 +262,14 @@ co_transfer_t co_transfer(coroutine *to, void *data);
 - `__tsan_switch_to_fiber`
 - `__tsan_destroy_fiber`
 
-（P2 實作項；目前 asymmetric-only 路徑尚未強制。）
-
-### 外部 stack API 決策（P2 decision item）
+### 外部 stack API 決策（後續）
 
 `co_stack_create_from` 已存在於內部／平台層。公開面二選一：
 
 - **建議 A（Recommend A）**：公開 `co_create_with_stack`，包裝 `co_stack_create_from`，供 P3 pool／測試餵預留區。
 - 替代 B：移除死 API，僅保留庫內 mmap／VirtualAlloc 路徑。
 
-P2 須明確鎖定其一；路線圖預設採 **A**。
+路線圖仍預設採 **A**；不阻擋 P2 核心合入。
 
 ---
 
@@ -283,11 +304,11 @@ P2 須明確鎖定其一；路線圖預設採 **A**。
 | P1  | `co_resume`/`co_yield_now` 帶 `void*`；`co_set_allocator`；`co_current`；CLS；可選 storage |
 | D-1..D-7 | `owner_id`、`co_thread_shutdown`、stack MAX、opt-in crash handler、ASan bounds/fake_stack |
 | D-9 | `co_cancel` / `CO_CANCEL` / `CANCEL_IGNORED` |
-| P2  | `co_transfer`；resume/yield 改為其上包裝；TSan fiber；外部 stack 公開決策                         |
+| P2  | `co_transfer` 走既有 mailbox；resume/yield 建其上；拒絕巢狀 WAITING steal 與 in-flight abandon；TSan／`co_create_with_stack` 為後續 |
 | P3  | stack pool 預設開啟；`co_create_opts` 選 share/copy                                   |
 
 
-內部 `[struct coroutine](coroutine_internal.h)` 預計擴充：`transfer`、`cls`、`stack_mode`、`save_buf`、`share` 指標；平台 `co_stack_*` 增加 external/pool 路徑。
+內部 `[struct coroutine](coroutine_internal.h)` 已有 `mailbox`、`cls`、`resume_target`、`defer`；P3 再擴 `stack_mode`、`save_buf`、`share`。平台 `co_stack_*` 增加 external/pool 路徑。
 
 ---
 
@@ -299,7 +320,10 @@ P2 須明確鎖定其一；路線圖預設採 **A**。
 - [ ] Handler／altstack：預設 off；`co_install_crash_handler(1)` opt-in；不覆寫宿主 altstack
 - [ ] `page_size` 並發 lazy init
 - [ ] Guard 表滿：無 eviction；新 stack 可能缺診斷
-- [ ] 乾淨連結：`Makefile.p0`／`Makefile.p1` 無多餘物件／符號衝突
+- [ ] 乾淨連結：`Makefile.p0`／`Makefile.p1`／`Makefile.p2` 無多餘物件／符號衝突
+- [ ] P2 sibling hop：A transfer B、B transfer 回 WAITING main；mailbox 與順序正確
+- [ ] P2 nested steal：內層不可 hop 到仍有 WAITING resume_target 的外層；回 `INVALID_STATE`
+- [ ] P2 abandon-inflight：外層仍停在 `co_resume(co)` 時禁止 `co_abandon(co)`
 
 ---
 
@@ -318,5 +342,6 @@ P2 須明確鎖定其一；路線圖預設採 **A**。
 1. **P0**（已完成）：regs + ASan + guard/生命週期測 + `make bench`
 2. **P1**（已完成）：傳值 + allocator + CLS
 3. **D-1..D-7**（已完成）：執行緒／堆疊／宿主／ASan／page_size／guard 表契約
-4. **P2**（1 迭代）：`co_transfer` 重構狀態機；TSan fiber；鎖定 `co_create_with_stack`（建議 A）
-5. **P3a pool → P3b copy-stack**：pool 可先合入；copy-stack 單獨 RFC/分支，附密度 benchmark 與限制文件
+4. **P2 transfer 核心**（已完成）：`co_transfer` 建在既有 mailbox 上；resume／yield 改為其上包裝；拒絕巢狀 WAITING steal 與 in-flight abandon
+5. **P2 後續**：TSan fiber；鎖定 `co_create_with_stack`（建議 A）
+6. **P3a pool → P3b copy-stack**：pool 可先合入；copy-stack 單獨 RFC/分支，附密度 benchmark 與限制文件
