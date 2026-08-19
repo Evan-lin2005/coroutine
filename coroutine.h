@@ -46,8 +46,8 @@ typedef struct coroutine coroutine;
  * 禁止以 TLS 物件位址當 id）。主協程（TLS main）亦綁定該執行緒。
  *
  * Mutating API — 僅允許 owner thread，否則回 CO_RESULT_WRONG_THREAD：
- *   co_resume, co_destroy, co_abandon, co_cancel, co_set_storage, co_defer,
- *   co_defer_cancel
+ *   co_resume, co_transfer, co_destroy, co_abandon, co_cancel, co_set_storage,
+ *   co_defer, co_defer_cancel
  *
  * 執行緒結束契約：
  *   - Owner 結束前不得仍持有非 CO_DONE 的協程，除非已呼叫 co_thread_shutdown()
@@ -95,8 +95,8 @@ typedef struct coroutine coroutine;
  * 參數：
  *   - self           — 本協程（等同協程內 co_current()）
  *   - userdata       — co_create 綁定的固定上下文（亦可用 co_userdata）
- *   - initial_input  — 首次 co_resume 經 mailbox 傳入的訊息；之後傳值
- *                      只走 co_yield_now 的 next_input
+ *   - initial_input  — 首次 co_resume／co_transfer 經 mailbox 傳入的訊息；之後傳值
+ *                      走 co_yield_now 的 next_input 或後續 co_transfer 的 *out data
  */
 typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input);
 
@@ -107,7 +107,10 @@ typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input
  * - AArch64 不保存 FPCR/FPSR（非 ABI callee-saved）；跨切換後 FP 環境暫存器可能改變，屬預期行為。
  *
  * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy /
- *   co_abandon / co_cancel。
+ *   co_abandon / co_cancel。CO_WAITING 可作為 co_transfer 目標（喚醒停在 resume／
+ *   transfer 裡的對方；這也是 co_yield_now 的路徑），但若該 WAITING 的
+ *   resume_target 仍為 WAITING（內層 resume 未返回）則拒絕，避免外層 resume
+ *   先返回、內層永遠卡死。此時應先 yield／transfer 回直接 caller。
  */
 
 /*
@@ -116,7 +119,7 @@ typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input
  * 若需明確錯誤碼（例如 CO_RESULT_OUT_OF_MEMORY），請改用 co_create_ex。
  *
  * userdata：寫入協程固定上下文，不經 mailbox；可用 co_userdata 讀回。
- * 首次訊息由 co_resume(co, input, ...) 的 input 作為 initial_input。
+ * 首次訊息由 co_resume(co, input, ...) 或 co_transfer(co, data, ...) 的 mailbox 作為 initial_input。
  */
 coroutine *co_create(size_t stack_size, co_function function, void *userdata);
 
@@ -137,35 +140,43 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
                         coroutine **out);
 
 /*
- * Mailbox 契約（resume / yield 一次性訊息）
+ * Mailbox 契約（resume / yield / transfer 一次性訊息）
  * ----------------------------------------------------------------
  * 每條協程有一個 mailbox。切換時：
  *   - 切出方寫入收件人：to->mailbox = outgoing
  *   - 切回後讀自己信箱並清空：incoming = from->mailbox; from->mailbox = NULL
  *
- * Out 參數（output / next_input）：
+ * Out 參數（output / next_input / co_transfer_t *out）：
  *   - 可為 NULL（表示呼叫端不取回傳值）。
- *   - 非 NULL 時，函式入口即寫入 *ptr = NULL；之後成功路徑再覆寫為實際訊息。
- *   - 因此任一錯誤返回後，*output / *next_input 皆為 NULL（不會殘留呼叫前舊值）。
+ *   - 非 NULL 時，函式入口即寫入 *ptr = NULL（transfer 則 prev/data 皆 NULL）；
+ *     之後成功路徑再覆寫為實際訊息。
+ *   - 因此任一錯誤返回後，out 參數皆為 NULL（不會殘留呼叫前舊值）。
  *
  * Message pointer lifetime（庫只搬運 void*，不擁有指向物件）：
- *   - ownership：傳入的 input / output 指標本體由呼叫端擁有；庫不 malloc、不 free、不深拷貝。
+ *   - ownership：傳入的 input / output / data 指標本體由呼叫端擁有；庫不 malloc、不 free、不深拷貝。
  *   - 有效期：指向的物件須在收件方「讀取並用完」前保持有效。典型上：
  *       · resume 的 input：至少活到目標協程消費後（首次為 callback 的 initial_input；
  *         其後為對方 co_yield_now 返回的 *next_input）。
  *       · yield 的 output：至少活到 caller 的 co_resume 返回並讀完 *output。
+ *       · transfer 的 data：至少活到目標消費後（首次為 initial_input；其後為對方
+ *         co_transfer／co_yield_now 醒來時的 *out data）。
  *   - 掛起期間若呼叫端已釋放訊息指向的記憶體而對方仍持有該 void* → Undefined Behavior。
  *   - 讀後清空：mailbox 消費後即為 NULL，不可當成跨多次切換的永久狀態。
  *
  * Normal-return semantics（callback 正常返回）：
- *   - co_function 返回後協程進入 CO_DONE；trampoline 將 caller->mailbox 設為 NULL。
+ *   - co_function 返回後協程進入 CO_DONE；trampoline 將 sink->mailbox 設為 NULL。
  *   - 因此成功的最後一次 co_resume 在目標結束時：*output == NULL（若 output 非 NULL）。
- *   - 沒有「函式回傳值」通道；若需傳回結果，必須在返回前以 co_yield_now(output, ...) 送出，
- *     或寫入 userdata / storage。正常結束本身不攜帶訊息。
+ *   - 沒有「函式回傳值」通道；若需傳回結果，必須在返回前以 co_yield_now(output, ...)
+ *     或 co_transfer(..., data, ...) 送出，或寫入 userdata / storage。正常結束本身不攜帶訊息。
  *
  * co_resume(co, input, output) — 從當前協程 resume 目標 co（須為 owner thread）：
  *   - input：傳給目標的訊息（首次 resume 時作為 co_function 的 initial_input）
  *   - output：成功且目標 yield 時為其 output；目標 CO_DONE（正常返回）時為 NULL。
+ *   - 純 resume／yield 路徑：控制流回到此 caller 才返回。若目標改用 co_transfer
+ *     跳到兄弟（且此 caller 沒有仍為 WAITING 的內層 resume），resume 要等有人
+ *     再切回此 caller；*output 是該次醒來的 mailbox，不一定來自當初的 target。
+ *   - 不可在內層仍 WAITING 時 hop 回此外層（見 co_transfer）；否則外層會先返回、
+ *     內層無法 destroy／abandon／cancel。
  *
  * co_yield_now(output, next_input) — 從當前協程 yield 回 caller：
  *   - output：傳給 caller 的訊息（出現在 caller 的 *output）
@@ -175,6 +186,31 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
  */
 co_result  co_resume(coroutine *co, void *input, void **output);
 co_result  co_yield_now(void *output, void **next_input);
+
+/*
+ * co_transfer — 對稱切換原語（resume／yield 的共同底層）
+ * ----------------------------------------------------------------
+ * 從 co_current() 一次切到 to，data 走 mailbox。兄弟協程可直接 hop，
+ * 不必先 yield 回 caller 再 resume。不改 caller 鏈、不把 from 標成 CO_WAITING。
+ *
+ *   - READY／SUSPENDED／WAITING：允許（WAITING 用於喚醒停在 resume／transfer 的對方）
+ *   - WAITING 但其 resume 的 target 仍為 WAITING：INVALID_STATE
+ *     （禁止偷走外層 resume；先 hop 回直接 caller）
+ *   - RUNNING（含 to == self）：ALREADY_RUNNING
+ *   - DONE：FINISHED
+ *   - 非 owner：WRONG_THREAD
+ *   - defer 中：INVALID_STATE
+ *   - to == NULL：INVALID_ARGUMENT
+ *
+ * out 可 NULL。成功時 out->prev 為剛切過來的協程，out->data 為 mailbox 訊息。
+ * trampoline 結束：有 caller 則切回 caller，否則切回 TLS main。
+ */
+typedef struct co_transfer_t {
+    coroutine *prev;
+    void      *data;
+} co_transfer_t;
+
+co_result  co_transfer(coroutine *to, void *data, co_transfer_t *out);
 co_result  co_destroy(coroutine *co);
 
 /*
@@ -265,7 +301,7 @@ co_result co_cancel(coroutine *co);
  * 槽滿回 CO_RESULT_OUT_OF_MEMORY：fn/arg 未入表，呼叫端仍持有 arg，須自行清理
  * （失敗路徑不會呼叫 fn）。
  *
- * fn 限制：不得 co_yield_now / co_resume / co_destroy / co_abandon /
+ * fn 限制：不得 co_yield_now / co_resume / co_transfer / co_destroy / co_abandon /
  * co_thread_shutdown / co_cls_set；arg 不得指向協程堆疊區域變數
  * （destroy 路徑框架已凍結）；不得用 CLS / pthread_getspecific；不得長時間阻塞。
  * defer 執行期間以執行緒 TLS 計數守衛（三個執行點皆算，不依賴 current==co）；

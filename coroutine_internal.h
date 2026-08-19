@@ -28,6 +28,9 @@ struct coroutine {
     void             *userdata;
     void             *mailbox;
     struct coroutine *caller;
+    /* co_resume 把 caller 設成 WAITING 時指向 target；resume 返回時清掉。
+     * transfer 到仍有內層 WAITING 的 waiter 會 strand，必須拒絕。 */
+    struct coroutine *resume_target;
     enum co_state     state;
     int               cancelling; /* 已 co_cancel；供 co_cancel_requested；第二次 co_cancel 不再注入 */
     /* process 生命週期內唯一、不因執行緒結束而重用的 owner 序號（0=未綁定／已清） */
