@@ -161,7 +161,7 @@ Plan.md                       路線圖（P0–P3 + D-1..D-7）
 | `make -f Makefile.p0 test` | callee-saved 暫存器、guard 溢位、巢狀深度、大量生命週期、`CO_WAITING` 重入 |
 | `make -f Makefile.p0 bench` | 空切換 throughput / cycles/switch |
 | `make p0-asan` | ASan build 跑 P0（`test_regs` 在 ASan 下會 SKIP，其餘應通過） |
-| `make -f Makefile.p0 test-tsan` | TSan build 跑 P0（與 ASan 互斥） |
+| `make -f Makefile.p0 test-tsan` | TSan build 跑 P0（與 ASan 互斥；目標強制 `CC=gcc`） |
 | `make -f Makefile.p1 test` | P1 mailbox、storage、allocator、CLS（含 `--cls-alloc-race` 獨立 process） |
 | `make -f Makefile.p1 test-tsan` | TSan build 跑 P1 |
 | `make -f Makefile.p2 test` | P2 `co_transfer` sibling hop、WAITING steal、in-flight abandon；非 TSan 下 fiber 測 SKIP |

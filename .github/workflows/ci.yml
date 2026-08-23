@@ -31,9 +31,10 @@ jobs:
       - name: D-6 page_size under TSan
         run: |
           make -f Makefile.p0 clean libobjs \
+            CC=gcc \
             CFLAGS='-std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -fsanitize=thread -fno-omit-frame-pointer' \
             LDFLAGS='-pthread -fsanitize=thread'
-          cc -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 \
+          gcc -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 \
             -fsanitize=thread -fno-omit-frame-pointer \
             -o test_d6_pagesize tests/repro/d6_pagesize.c \
             coroutine.o platform/Linux_x86/SystemV.o platform/Linux_x86/sysV.o \

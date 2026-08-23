@@ -1,0 +1,10 @@
+# build artifacts
+*.o
+test_p0
+test_p1
+test_p2
+test_d6_pagesize
+bench_switch
+bench_hop
+test_p0_asan
+debug-*.log

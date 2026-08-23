@@ -28,6 +28,7 @@ test: test_p1
 
 test-tsan:
 	$(MAKE) -f Makefile.p1 clean test_p1 \
+		CC=gcc \
 		CFLAGS='$(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer' \
 		LDFLAGS='$(LDFLAGS) -fsanitize=thread'
 	./test_p1

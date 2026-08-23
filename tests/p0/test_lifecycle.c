@@ -285,61 +285,99 @@ void test_orphan_shutdown_warns(void)
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __SANITIZE_THREAD__
+#  define CO_P0_TSAN 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_P0_TSAN 1
+#  endif
+#endif
+#ifndef CO_P0_TSAN
+#  define CO_P0_TSAN 0
+#endif
+
 static coroutine *g_d1_co;
-static volatile int g_d1_step;
-static volatile int g_d1_ready;
-static volatile int g_d1_done;
+static int g_d1_step;
+static int g_d1_ready;
+static int g_d1_done;
+
+static void d1_store(int *p, int v)
+{
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+static int d1_load(int *p)
+{
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static void d1_store_co(coroutine *co)
+{
+    __atomic_store_n(&g_d1_co, co, __ATOMIC_RELEASE);
+}
+
+static coroutine *d1_load_co(void)
+{
+    return __atomic_load_n(&g_d1_co, __ATOMIC_ACQUIRE);
+}
 
 static void fn_d1_owner(coroutine *self, void *ud, void *in)
 {
     (void)self;
     (void)ud;
     (void)in;
-    g_d1_step = 1;
+    d1_store(&g_d1_step, 1);
     (void)P0_YIELD();
-    g_d1_step = 2;
+    d1_store(&g_d1_step, 2);
 }
 
 static void *d1_owner_thread(void *arg)
 {
+    coroutine *co;
+
     (void)arg;
-    g_d1_co = co_create(CO_MIN_STACK_SIZE, fn_d1_owner, NULL);
-    if (!g_d1_co) {
+    co = co_create(CO_MIN_STACK_SIZE, fn_d1_owner, NULL);
+    d1_store_co(co);
+    if (!co) {
         g_p0_failures++;
-        g_d1_ready = 1;
+        d1_store(&g_d1_ready, 1);
         return NULL;
     }
-    if (P0_RESUME(g_d1_co) != CO_RESULT_OK)
+    if (P0_RESUME(co) != CO_RESULT_OK)
         g_p0_failures++;
     /* owner 仍存活：讓另一執行緒探測 WRONG_THREAD（避免 exit reclaim 造成 UAF） */
-    g_d1_ready = 1;
-    while (!g_d1_done) {
+    d1_store(&g_d1_ready, 1);
+    while (!d1_load(&g_d1_done)) {
         /* spin */
     }
-    if (g_d1_co) {
-        (void)P0_RESUME(g_d1_co);
-        (void)co_destroy(g_d1_co);
-        g_d1_co = NULL;
+    co = d1_load_co();
+    if (co) {
+        (void)P0_RESUME(co);
+        (void)co_destroy(co);
+        d1_store_co(NULL);
     }
     return NULL;
 }
 
 static void *d1_reuse_thread(void *arg)
 {
-    co_result r;
+    co_result  r;
+    coroutine *co;
+
     (void)arg;
-    while (!g_d1_ready) {
+    while (!d1_load(&g_d1_ready)) {
     }
-    if (!g_d1_co) {
-        g_d1_done = 1;
+    co = d1_load_co();
+    if (!co) {
+        d1_store(&g_d1_done, 1);
         return NULL;
     }
-    r = co_resume(g_d1_co, NULL, NULL);
+    r = co_resume(co, NULL, NULL);
     p0_expect(__LINE__, "cross-thread resume", r, CO_RESULT_WRONG_THREAD);
-    p0_expect(__LINE__, "step still after first yield", g_d1_step, 1);
-    r = co_destroy(g_d1_co);
+    p0_expect(__LINE__, "step still after first yield", d1_load(&g_d1_step), 1);
+    r = co_destroy(co);
     p0_expect(__LINE__, "cross-thread destroy", r, CO_RESULT_WRONG_THREAD);
-    g_d1_done = 1;
+    d1_store(&g_d1_done, 1);
     return NULL;
 }
 
@@ -347,10 +385,10 @@ void test_owner_cross_generation(void)
 {
     pthread_t a, b;
 
-    g_d1_step = 0;
-    g_d1_co = NULL;
-    g_d1_ready = 0;
-    g_d1_done = 0;
+    d1_store(&g_d1_step, 0);
+    d1_store_co(NULL);
+    d1_store(&g_d1_ready, 0);
+    d1_store(&g_d1_done, 0);
 
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
            "start cross-thread owner test", "{}");
@@ -360,7 +398,7 @@ void test_owner_cross_generation(void)
         return;
     }
     if (pthread_create(&b, NULL, d1_reuse_thread, NULL) != 0) {
-        g_d1_done = 1;
+        d1_store(&g_d1_done, 1);
         pthread_join(a, NULL);
         g_p0_failures++;
         return;
@@ -491,6 +529,12 @@ static int run_worker_capture_stderr(void *(*worker)(void *),
 void test_orphan_warn_count(void)
 {
     char buf[2048];
+
+#if CO_P0_TSAN
+    /* TSan 與 fork+擷取 stderr 不相容；非 TSan 建置仍覆蓋計數語意 */
+    fprintf(stderr, "SKIP orphan-warn-count: fork capture unsupported under TSan\n");
+    return;
+#endif
 
     if (run_worker_capture_stderr(orphan_mixed_worker, buf, sizeof buf) != 0) {
         fprintf(stderr, "FAIL orphan-warn-count: mixed worker failed\n");
