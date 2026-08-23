@@ -15,3 +15,27 @@ jobs:
         run: make -f Makefile.p0 test-ndebug
       - name: P1 tests
         run: make -f Makefile.p1 test
+      - name: P2 tests
+        run: make -f Makefile.p2 test
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: P0 TSan
+        run: make -f Makefile.p0 test-tsan
+      - name: P1 TSan
+        run: make -f Makefile.p1 test-tsan
+      - name: P2 TSan
+        run: make -f Makefile.p2 test-tsan
+      - name: D-6 page_size under TSan
+        run: |
+          make -f Makefile.p0 clean libobjs \
+            CFLAGS='-std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -fsanitize=thread -fno-omit-frame-pointer' \
+            LDFLAGS='-pthread -fsanitize=thread'
+          cc -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 \
+            -fsanitize=thread -fno-omit-frame-pointer \
+            -o test_d6_pagesize tests/repro/d6_pagesize.c \
+            coroutine.o platform/Linux_x86/SystemV.o platform/Linux_x86/sysV.o \
+            -pthread -fsanitize=thread
+          ./test_d6_pagesize

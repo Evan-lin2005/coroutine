@@ -31,6 +31,7 @@
 - **執行緒結束**：`co_thread_shutdown` 為 caller 義務入口；未清理時 thread-exit 會 orphan reclaim 庫資源
 - **Guard 溢位診斷**：預設嵌入友善（不安裝 handler）；`co_install_crash_handler(1)` 才啟用；表滿（4096）時不淘汰舊條目，新堆疊可能缺診斷
 - **ASan fiber 註解**：主協程邊界來自 `co_platform_query_thread_stack`；`asan_fake_stack` 支援 `-fsanitize=address` 下 use-after-return
+- **TSan fiber 註解**：`-fsanitize=thread` 下 create／`co_do_switch`／destroy 接 `__tsan_*_fiber`（main 用 `get_current_fiber`；切換 flags=0）；與 ASan 互斥
 - **可選堆疊用量偵測**：`-DCO_DEBUG_STACK_USAGE` 啟用 `co_stack_peak`
 
 ## 支援平台
@@ -160,8 +161,11 @@ Plan.md                       路線圖（P0–P3 + D-1..D-7）
 | `make -f Makefile.p0 test` | callee-saved 暫存器、guard 溢位、巢狀深度、大量生命週期、`CO_WAITING` 重入 |
 | `make -f Makefile.p0 bench` | 空切換 throughput / cycles/switch |
 | `make p0-asan` | ASan build 跑 P0（`test_regs` 在 ASan 下會 SKIP，其餘應通過） |
+| `make -f Makefile.p0 test-tsan` | TSan build 跑 P0（與 ASan 互斥） |
 | `make -f Makefile.p1 test` | P1 mailbox、storage、allocator、CLS（含 `--cls-alloc-race` 獨立 process） |
-| `make -f Makefile.p2 test` | P2 `co_transfer` sibling hop、WAITING steal、in-flight abandon |
+| `make -f Makefile.p1 test-tsan` | TSan build 跑 P1 |
+| `make -f Makefile.p2 test` | P2 `co_transfer` sibling hop、WAITING steal、in-flight abandon；非 TSan 下 fiber 測 SKIP |
+| `make -f Makefile.p2 test-tsan` | TSan build 跑 P2（含 fiber HB／生命週期） |
 | `make -f Makefile.p2 bench` | hop 對照：`main_yield`／`sched_main`／`nested_resume`／`transfer` |
 
 P0 可單獨跑：
@@ -178,7 +182,7 @@ P0 可單獨跑：
 2. **P1（已完成）** — mailbox 傳值、allocator、storage、`co_current`、CLS
 3. **D-1..D-7（已完成）** — owner／shutdown、stack bounds、opt-in handler、ASan、page_size、guard 表
 4. **P2（已完成）** — `co_transfer` 為底層；拒絕巢狀 WAITING steal 與 in-flight abandon
-5. **P2 後續** — TSan fiber；鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
+5. **P2 後續（部分完成）** — **TSan fiber 已落地**；尚待鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
 6. **P3** — stack pool，再可選 shared copy-stack（禁巢狀、高風險）
 
 ### 刻意不做

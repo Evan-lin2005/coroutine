@@ -55,6 +55,16 @@ struct coroutine {
     size_t            asan_stack_size;
     void             *asan_fake_stack;   /* start_switch 保存；finish_switch 還原 */
 #endif
+#ifdef __SANITIZE_THREAD__
+#  define CO_TSAN_FIELDS 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_TSAN_FIELDS 1
+#  endif
+#endif
+#ifdef CO_TSAN_FIELDS
+    void             *tsan_fiber; /* main：get_current；heap：create_fiber；切換前 switch_to */
+#endif
     struct co_defer_entry defer[CO_DEFER_SLOTS];
     unsigned defer_count;
     int defer_running;

@@ -32,11 +32,12 @@
 #endif
 
 /*
- * ASan fiber 切換註解
+ * ASan / TSan fiber 註解（編譯期隔離；兩者通常互斥）
  * ----------------------------------------------------------------
- * 依 LLVM sanitizer 契約：start 在切換前呼叫（fake_stack 存於 from 協程），
- * finish 在目標 stack 開始執行時（trampoline）或切換返回 from 時呼叫。
- * main 邊界以平台 API 在 ensure_initialized 一次取得，不依賴 finish 配對。
+ * ASan：start 在切換前（fake_stack 存於 from）；finish 在返回 from 或
+ *       trampoline 首次進入時。main 邊界於 ensure_initialized 取得。
+ * TSan：create／destroy 綁 heap fiber；switch_to 緊貼 co_context_switch 前；
+ *       main 只用 get_current_fiber，永不 destroy。flags=0 建立 happens-before。
  */
 #ifdef __SANITIZE_ADDRESS__
 #  define CO_ASAN_FIBER 1
@@ -47,6 +48,17 @@
 #endif
 #ifndef CO_ASAN_FIBER
 #  define CO_ASAN_FIBER 0
+#endif
+
+#ifdef __SANITIZE_THREAD__
+#  define CO_TSAN_FIBER 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_TSAN_FIBER 1
+#  endif
+#endif
+#ifndef CO_TSAN_FIBER
+#  define CO_TSAN_FIBER 0
 #endif
 
 #if CO_ASAN_FIBER
@@ -93,27 +105,22 @@ static void co_asan_finish_switch(struct coroutine *fake_stack_owner)
     __sanitizer_finish_switch_fiber(fs, &bottom_old, &size_old);
 }
 
-static void co_do_switch(struct co_context *from, struct co_context *to,
-                         struct coroutine *from_co, struct coroutine *to_co)
-{
-    co_asan_start_switch(from_co, to_co);
-    co_context_switch(from, to);
-    /* 回到 from：還原 from 離開時保存的 fake stack */
-    co_asan_finish_switch(from_co);
-}
-
 static void co_asan_finish_on_enter(struct coroutine *caller)
 {
     /* 首次進入 fiber：finish 使用 caller 在 start_switch 時保存的 fake stack */
     co_asan_finish_switch(caller);
 }
 #else
-static void co_do_switch(struct co_context *from, struct co_context *to,
-                         struct coroutine *from_co, struct coroutine *to_co)
+static void co_asan_start_switch(struct coroutine *from_co,
+                                 const struct coroutine *to_co)
 {
     (void)from_co;
     (void)to_co;
-    co_context_switch(from, to);
+}
+
+static void co_asan_finish_switch(struct coroutine *fake_stack_owner)
+{
+    (void)fake_stack_owner;
 }
 
 static void co_asan_finish_on_enter(struct coroutine *from_co)
@@ -121,6 +128,72 @@ static void co_asan_finish_on_enter(struct coroutine *from_co)
     (void)from_co;
 }
 #endif
+
+#if CO_TSAN_FIBER
+extern void *__tsan_get_current_fiber(void);
+extern void *__tsan_create_fiber(unsigned flags);
+extern void  __tsan_destroy_fiber(void *fiber);
+extern void  __tsan_switch_to_fiber(void *fiber, unsigned flags);
+
+static void co_tsan_bind_main(struct coroutine *main_co)
+{
+    if (main_co && !main_co->tsan_fiber)
+        main_co->tsan_fiber = __tsan_get_current_fiber();
+}
+
+static int co_tsan_create(struct coroutine *co)
+{
+    if (!co)
+        return -1;
+    co->tsan_fiber = __tsan_create_fiber(0);
+    return co->tsan_fiber ? 0 : -1;
+}
+
+static void co_tsan_destroy(struct coroutine *co)
+{
+    if (!co || !co->tsan_fiber)
+        return;
+    __tsan_destroy_fiber(co->tsan_fiber);
+    co->tsan_fiber = NULL;
+}
+
+static void co_tsan_switch_to(const struct coroutine *to_co)
+{
+    if (to_co && to_co->tsan_fiber)
+        __tsan_switch_to_fiber(to_co->tsan_fiber, 0);
+}
+#else
+static void co_tsan_bind_main(struct coroutine *main_co)
+{
+    (void)main_co;
+}
+
+static int co_tsan_create(struct coroutine *co)
+{
+    (void)co;
+    return 0;
+}
+
+static void co_tsan_destroy(struct coroutine *co)
+{
+    (void)co;
+}
+
+static void co_tsan_switch_to(const struct coroutine *to_co)
+{
+    (void)to_co;
+}
+#endif
+
+static void co_do_switch(struct co_context *from, struct co_context *to,
+                         struct coroutine *from_co, struct coroutine *to_co)
+{
+    co_asan_start_switch(from_co, to_co);
+    co_tsan_switch_to(to_co);
+    co_context_switch(from, to);
+    /* 回到 from：還原 from 離開時保存的 fake stack（ASan）；TSan 已在切出側切換 */
+    co_asan_finish_switch(from_co);
+}
 
 /* ------------------------------------------------------------------ *
  * thread-local 狀態 / owner 身分（單調序號，不回收）
@@ -286,7 +359,7 @@ static void ensure_initialized(void)
         current_coroutine       = &main_coroutine;
         main_coroutine.state    = CO_RUNNING;
         main_coroutine.owner_id = co_self_thread_id();
-//掛上asan_stack_bottom和asan_stack_size，Asan需要知道主協程（main）的 OS 執行緒堆疊邊界
+/* 掛上 asan_stack_bottom／asan_stack_size；TSan 綁定 OS thread 的 current fiber */
 #if CO_ASAN_FIBER
         {
             const void *bottom = NULL;
@@ -297,6 +370,7 @@ static void ensure_initialized(void)
             }
         }
 #endif
+        co_tsan_bind_main(&main_coroutine);
     }
 }
 
@@ -449,6 +523,7 @@ static void co_release_owned(struct coroutine *co)
 
     co_live_unlink(co);
     co_run_defers(co);
+    co_tsan_destroy(co);
     co_stack_destroy(&co->stack);
     co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
     co_mem_free_with(&snap, co, sizeof *co);
@@ -473,6 +548,7 @@ static void co_internal_reclaim_orphan(struct coroutine *co)
     snap = co->allocator;
     co_live_unlink(co);
     co_run_defers(co);
+    co_tsan_destroy(co);
     sp = __builtin_frame_address(0);
     /*
      * TLS/atexit 可能仍在這塊 mmap 上執行。munmap 腳下會在返回時 SIGSEGV
@@ -680,6 +756,12 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     co->owner_id  = co_self_thread_id();
 
     initialize_context(co);
+    if (co_tsan_create(co) != 0) {
+        co_allocator snap = co->allocator;
+        co_stack_destroy(&co->stack);
+        co_mem_free_with(&snap, co, sizeof *co);
+        return CO_RESULT_OUT_OF_MEMORY;
+    }
     co_live_link(co);
     *out = co;
     return CO_RESULT_OK;

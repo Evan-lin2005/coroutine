@@ -13,7 +13,7 @@ P1_SRCS = tests/p0/p0_common.c tests/p1/test_p1_main.c tests/p1/test_transfer.c 
           tests/p1/test_storage.c tests/p1/test_allocator.c tests/p1/test_cls.c
 P1_OBJS = $(P1_SRCS:.c=.o)
 
-.PHONY: all test clean libobjs
+.PHONY: all test clean libobjs test-tsan
 
 all: test_p1
 
@@ -23,6 +23,13 @@ test_p1: $(LIB_OBJ) $(P1_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P1_OBJS) $(LDFLAGS)
 
 test: test_p1
+	./test_p1
+	./test_p1 --cls-alloc-race
+
+test-tsan:
+	$(MAKE) -f Makefile.p1 clean test_p1 \
+		CFLAGS='$(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer' \
+		LDFLAGS='$(LDFLAGS) -fsanitize=thread'
 	./test_p1
 	./test_p1 --cls-alloc-race
 

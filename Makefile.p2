@@ -10,10 +10,11 @@ LIB_C   = coroutine.c platform/Linux_x86/SystemV.c
 LIB_ASM = platform/Linux_x86/sysV.S
 LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
 
-P2_SRCS = tests/p0/p0_common.c tests/p2/test_p2_main.c tests/p2/test_co_transfer.c
+P2_SRCS = tests/p0/p0_common.c tests/p2/test_p2_main.c tests/p2/test_co_transfer.c \
+          tests/p2/test_tsan_fiber.c
 P2_OBJS = $(P2_SRCS:.c=.o)
 
-.PHONY: all test bench clean libobjs
+.PHONY: all test bench clean libobjs test-tsan
 
 all: test_p2 bench_hop
 
@@ -23,6 +24,12 @@ test_p2: $(LIB_OBJ) $(P2_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P2_OBJS) $(LDFLAGS)
 
 test: test_p2
+	./test_p2
+
+test-tsan:
+	$(MAKE) -f Makefile.p2 clean test_p2 \
+		CFLAGS='$(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer' \
+		LDFLAGS='$(LDFLAGS) -fsanitize=thread'
 	./test_p2
 
 bench_hop: $(LIB_OBJ) tests/p2/bench_hop.o

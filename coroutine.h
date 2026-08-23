@@ -537,6 +537,10 @@ void co_set_allocator(const co_allocator *a);
  * ASan：以 -fsanitize=address 建置時，切換會保存／還原 fake_stack，
  * 以支援 stack use-after-return 偵測。
  *
+ * TSan：以 -fsanitize=thread 建置時，在 create／switch／destroy 接上
+ * __tsan_*_fiber（main 用 get_current_fiber；切換 flags=0 建立 happens-before）。
+ * 與 ASan 建置互斥；非 TSan 建置零開銷。
+ *
  * 亦可於編譯期定義 CO_INSTALL_SIGSEGV_HANDLER，使首次平台 init 自動等同 enable=1。
  */
 void co_install_crash_handler(int enable);

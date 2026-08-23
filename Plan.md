@@ -251,16 +251,20 @@ if (co->caller && co->caller->state == CO_WAITING &&
 
 ### 測試與 bench
 
-- `make -f Makefile.p2 test`：`tests/p2/test_co_transfer.c` — sibling-hop、abandon-inflight、first-entry、no-caller-yield、transfer-waiting、nested-steal、indirect-steal、rejects、wrong-thread。
+- `make -f Makefile.p2 test`：`tests/p2/test_co_transfer.c` — sibling-hop、abandon-inflight、first-entry、no-caller-yield、transfer-waiting、nested-steal、indirect-steal、rejects、wrong-thread；`test_tsan_fiber` 在非 TSan 建置 SKIP。
 - `make -f Makefile.p2 bench`：`tests/p2/bench_hop.c` — `main_yield`／`sched_main`／`nested_resume`／`transfer` hop 對照。兄弟 `co_transfer` 比「main 當 dispatcher」快；單 fiber `resume`／`yield` 路徑不因此加速。
+- `make -f Makefile.p{0,1,2} test-tsan`：`-fsanitize=thread` 下跑對應 suite（與 ASan 互斥）。
 
-### TSan fiber annotations（後續，本迭代不做）
+### TSan fiber annotations（已落地）
 
-當存在 `co_transfer`／跨 fiber 排程器時，需在 create／switch／destroy 接上：
+在 create／`co_do_switch`／release 接上（編譯期 `#ifdef`，不改公開 API／asm／狀態機）：
 
-- `__tsan_create_fiber`
-- `__tsan_switch_to_fiber`
-- `__tsan_destroy_fiber`
+- `__tsan_get_current_fiber` — main（`ensure_initialized`）
+- `__tsan_create_fiber(0)` — heap fiber（`co_create_ex`）
+- `__tsan_switch_to_fiber(to, 0)` — 緊貼 `co_context_switch` 前（flags=0 建立 happens-before）
+- `__tsan_destroy_fiber` — `co_release_owned`／orphan reclaim（永不 destroy main）
+
+驗證：`tests/p2/test_tsan_fiber.c`（生命週期＋transfer HB）；既有 suite 與 `tests/repro/d6_pagesize.c` 在 TSan 下須綠燈。
 
 ### 外部 stack API 決策（後續）
 
@@ -304,7 +308,7 @@ if (co->caller && co->caller->state == CO_WAITING &&
 | P1  | `co_resume`/`co_yield_now` 帶 `void*`；`co_set_allocator`；`co_current`；CLS；可選 storage |
 | D-1..D-7 | `owner_id`、`co_thread_shutdown`、stack MAX、opt-in crash handler、ASan bounds/fake_stack |
 | D-9 | `co_cancel` / `CO_CANCEL` / `CANCEL_IGNORED` |
-| P2  | `co_transfer` 走既有 mailbox；resume/yield 建其上；拒絕巢狀 WAITING steal 與 in-flight abandon；TSan／`co_create_with_stack` 為後續 |
+| P2  | `co_transfer` 走既有 mailbox；resume/yield 建其上；拒絕巢狀 WAITING steal 與 in-flight abandon；TSan fiber 已接；`co_create_with_stack` 為後續 |
 | P3  | stack pool 預設開啟；`co_create_opts` 選 share/copy                                   |
 
 
@@ -324,6 +328,7 @@ if (co->caller && co->caller->state == CO_WAITING &&
 - [ ] P2 sibling hop：A transfer B、B transfer 回 WAITING main；mailbox 與順序正確
 - [ ] P2 nested steal：內層不可 hop 到仍有 WAITING resume_target 的外層；回 `INVALID_STATE`
 - [ ] P2 abandon-inflight：外層仍停在 `co_resume(co)` 時禁止 `co_abandon(co)`
+- [ ] TSan fiber：create／switch／destroy；`make -f Makefile.p{0,1,2} test-tsan` 綠；HB／lifecycle 測
 
 ---
 
@@ -343,5 +348,5 @@ if (co->caller && co->caller->state == CO_WAITING &&
 2. **P1**（已完成）：傳值 + allocator + CLS
 3. **D-1..D-7**（已完成）：執行緒／堆疊／宿主／ASan／page_size／guard 表契約
 4. **P2 transfer 核心**（已完成）：`co_transfer` 建在既有 mailbox 上；resume／yield 改為其上包裝；拒絕巢狀 WAITING steal 與 in-flight abandon
-5. **P2 後續**：TSan fiber；鎖定 `co_create_with_stack`（建議 A）
+5. **P2 後續**：TSan fiber（已完成）；鎖定 `co_create_with_stack`（建議 A）
 6. **P3a pool → P3b copy-stack**：pool 可先合入；copy-stack 單獨 RFC/分支，附密度 benchmark 與限制文件

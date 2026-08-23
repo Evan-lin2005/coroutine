@@ -20,6 +20,8 @@ void test_nested_steal_rejected(void);
 void test_indirect_steal_rejected(void);
 void test_transfer_rejects(void);
 void test_transfer_wrong_thread(void);
+void test_tsan_fiber_hb(void);
+void test_tsan_fiber_lifecycle(void);
 
 static void run_one(const char *name, void (*fn)(void))
 {
@@ -56,6 +58,10 @@ int main(int argc, char **argv)
             run_all = 0, run_one("rejects", test_transfer_rejects);
         if (strcmp(argv[i], "--wrong-thread") == 0)
             run_all = 0, run_one("wrong-thread", test_transfer_wrong_thread);
+        if (strcmp(argv[i], "--tsan-hb") == 0)
+            run_all = 0, run_one("tsan-fiber-hb", test_tsan_fiber_hb);
+        if (strcmp(argv[i], "--tsan-life") == 0)
+            run_all = 0, run_one("tsan-fiber-lifecycle", test_tsan_fiber_lifecycle);
     }
 
     if (run_all) {
@@ -68,6 +74,8 @@ int main(int argc, char **argv)
         run_one("indirect-steal", test_indirect_steal_rejected);
         run_one("rejects", test_transfer_rejects);
         run_one("wrong-thread", test_transfer_wrong_thread);
+        run_one("tsan-fiber-hb", test_tsan_fiber_hb);
+        run_one("tsan-fiber-lifecycle", test_tsan_fiber_lifecycle);
     }
 
     if (g_p0_failures) {
