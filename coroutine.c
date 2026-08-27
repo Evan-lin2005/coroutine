@@ -138,6 +138,178 @@ static CO_THREAD_LOCAL struct coroutine *g_transfer_from; /* 上次切出方；�
 static CO_THREAD_LOCAL struct coroutine *g_live_head; /* per-thread 雙向鏈頭 */
 static CO_THREAD_LOCAL int               tls_defer_running;
 
+/*
+ * P3a stack pool：每執行緒、每 size class 一條 LIFO（預設每檔 8 塊）。
+ * -DCO_POOL_PER_CLASS=0 改為全 class 合計 8 塊（舊上限，供對照）。
+ * 池存 co_stack metadata 複本；>512KiB、external、ASan 不進池。
+ */
+#ifndef CO_POOL_SLOTS
+#  define CO_POOL_SLOTS 8
+#endif
+#ifndef CO_POOL_PER_CLASS
+#  define CO_POOL_PER_CLASS 1
+#endif
+#define CO_POOL_NCLASS 6
+
+struct co_stack_pool {
+    struct co_stack slot[CO_POOL_NCLASS][CO_POOL_SLOTS];
+    unsigned        n[CO_POOL_NCLASS];
+};
+
+static CO_THREAD_LOCAL struct co_stack_pool g_pool;
+static CO_THREAD_LOCAL unsigned long long g_pool_hit;
+static CO_THREAD_LOCAL unsigned long long g_pool_miss;
+static CO_THREAD_LOCAL unsigned long long g_pool_drop;
+
+static size_t co_stack_usable(const struct co_stack *s)
+{
+    if (!s || !s->lo || !s->hi || s->hi <= s->lo)
+        return 0;
+    return (size_t)((char *)s->hi - (char *)s->lo);
+}
+
+/* 16K/32K/64K/128K/256K/512K；更大回 -1（不進池） */
+static int co_pool_class(size_t n)
+{
+    static const size_t k[CO_POOL_NCLASS] = {
+        16u * 1024u, 32u * 1024u, 64u * 1024u,
+        128u * 1024u, 256u * 1024u, 512u * 1024u
+    };
+    unsigned i;
+
+    if (n == 0)
+        return -1;
+    for (i = 0; i < CO_POOL_NCLASS; i++) {
+        if (n <= k[i])
+            return (int)i;
+    }
+    return -1;
+}
+
+#if !CO_POOL_PER_CLASS
+static unsigned co_pool_occupied(void)
+{
+    unsigned i, t = 0;
+
+    for (i = 0; i < CO_POOL_NCLASS; i++)
+        t += g_pool.n[i];
+    return t;
+}
+#endif
+
+static void co_pool_drain(void)
+{
+    unsigned c, i;
+
+    for (c = 0; c < CO_POOL_NCLASS; c++) {
+        for (i = 0; i < g_pool.n[c]; i++)
+            co_stack_destroy(&g_pool.slot[c][i]);
+        g_pool.n[c] = 0;
+    }
+}
+
+void co_pool_debug_stats(unsigned long long *hit, unsigned long long *miss,
+                         unsigned long long *drop)
+{
+    if (hit)
+        *hit = g_pool_hit;
+    if (miss)
+        *miss = g_pool_miss;
+    if (drop)
+        *drop = g_pool_drop;
+}
+
+void co_pool_debug_stats_reset(void)
+{
+    g_pool_hit = 0;
+    g_pool_miss = 0;
+    g_pool_drop = 0;
+}
+
+#if CO_ASAN_FIBER
+static int co_pool_take(struct co_stack *out, size_t want)
+{
+    (void)out;
+    (void)want;
+    g_pool_miss++;
+    return -1;
+}
+
+static void co_pool_give(struct co_stack *s)
+{
+    if (s && s->base)
+        g_pool_drop++;
+    co_stack_destroy(s);
+}
+#else
+static int co_pool_take(struct co_stack *out, size_t want)
+{
+    int cls = co_pool_class(want);
+    unsigned n, i;
+
+    if (!out || cls < 0)
+        return -1;
+    n = g_pool.n[cls];
+    if (n == 0) {
+        g_pool_miss++;
+        return -1;
+    }
+
+    for (i = n; i-- > 0; ) {
+        size_t usable = co_stack_usable(&g_pool.slot[cls][i]);
+        if (usable >= want) {
+            *out = g_pool.slot[cls][i];
+            g_pool.n[cls] = n - 1;
+            if (i != n - 1)
+                g_pool.slot[cls][i] = g_pool.slot[cls][n - 1];
+            memset(&g_pool.slot[cls][n - 1], 0,
+                   sizeof g_pool.slot[cls][n - 1]);
+#ifdef CO_DEBUG_STACK_USAGE
+            memset(out->lo, 0xCD, usable);
+#endif
+            g_pool_hit++;
+            return 0;
+        }
+    }
+    g_pool_miss++;
+    return -1;
+}
+
+static int co_pool_at_cap(int cls)
+{
+#if CO_POOL_PER_CLASS
+    return g_pool.n[cls] >= CO_POOL_SLOTS;
+#else
+    (void)cls;
+    return co_pool_occupied() >= CO_POOL_SLOTS;
+#endif
+}
+
+static void co_pool_give(struct co_stack *s)
+{
+    int cls;
+
+    if (!s || !s->base) {
+        if (s)
+            memset(s, 0, sizeof *s);
+        return;
+    }
+    if (s->external) {
+        co_stack_destroy(s);
+        return;
+    }
+    cls = co_pool_class(co_stack_usable(s));
+    if (cls < 0 || co_pool_at_cap(cls)) {
+        g_pool_drop++;
+        co_stack_destroy(s);
+        return;
+    }
+    g_pool.slot[cls][g_pool.n[cls]] = *s;
+    g_pool.n[cls]++;
+    memset(s, 0, sizeof *s);
+}
+#endif
+
 static uint64_t co_self_thread_id(void)
 {
     if (thread_id == 0) {
@@ -176,6 +348,7 @@ static void co_orphan_reclaim_all(void)
             leaked++;
         co_internal_reclaim_orphan(co);
     }
+    co_pool_drain();
     if (leaked > 0) {
         fprintf(stderr,
                 "coroutine orphan: owner thread exited with %zu suspended "
@@ -441,7 +614,7 @@ static void co_release_owned(struct coroutine *co)
 
     co_live_unlink(co);
     co_run_defers(co);
-    co_stack_destroy(&co->stack);
+    co_pool_give(&co->stack);
     co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
     co_mem_free_with(&snap, co, sizeof *co);
 }
@@ -506,6 +679,7 @@ void co_install_crash_handler(int enable)
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #  include <windows.h>
+#include "coroutine.h"
 
 static unsigned co_atomic_load_relaxed(unsigned *p)
 {
@@ -641,7 +815,8 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     /* 快照當前 allocator；destroy 永遠用此副本，不依賴之後的 co_set_allocator */
     co->allocator = g_allocator;
 
-    if (co_stack_create(&co->stack, stack_size) != 0) {
+    if (co_pool_take(&co->stack, stack_size) != 0 &&
+        co_stack_create(&co->stack, stack_size) != 0) {
         co_allocator snap = co->allocator;
         co_mem_free_with(&snap, co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
@@ -923,6 +1098,8 @@ co_result co_thread_shutdown(size_t *leaked_count)
         }
         co = next;
     }
+
+    co_pool_drain();
 
     if (leaked_count)
         *leaked_count = leaked;
