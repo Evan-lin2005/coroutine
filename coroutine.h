@@ -108,7 +108,9 @@ typedef void (*co_function)(coroutine *self, void *userdata, void *initial_input
  *
  * 巢狀 resume：外層協程在子協程執行期間為 CO_WAITING，不可 co_resume / co_destroy /
  *   co_abandon / co_cancel。CO_WAITING 可作為 co_transfer 目標（喚醒停在 resume／
- *   transfer 裡的對方；這也是 co_yield_now 的路徑）。
+ *   transfer 裡的對方；這也是 co_yield_now 的路徑），但若該 WAITING 的
+ *   resume_target 仍為 WAITING（內層 resume 未返回）則拒絕，避免外層 resume
+ *   先返回、內層永遠卡死。此時應先 yield／transfer 回直接 caller。
  */
 
 /*
@@ -171,8 +173,10 @@ co_result  co_create_ex(size_t stack_size, co_function function, void *userdata,
  *   - input：傳給目標的訊息（首次 resume 時作為 co_function 的 initial_input）
  *   - output：成功且目標 yield 時為其 output；目標 CO_DONE（正常返回）時為 NULL。
  *   - 純 resume／yield 路徑：控制流回到此 caller 才返回。若目標改用 co_transfer
- *     跳到兄弟，resume 要等有人再切回此 caller；*output 是該次醒來的 mailbox，
- *     不一定來自當初的 target。
+ *     跳到兄弟（且此 caller 沒有仍為 WAITING 的內層 resume），resume 要等有人
+ *     再切回此 caller；*output 是該次醒來的 mailbox，不一定來自當初的 target。
+ *   - 不可在內層仍 WAITING 時 hop 回此外層（見 co_transfer）；否則外層會先返回、
+ *     內層無法 destroy／abandon／cancel。
  *
  * co_yield_now(output, next_input) — 從當前協程 yield 回 caller：
  *   - output：傳給 caller 的訊息（出現在 caller 的 *output）
@@ -190,6 +194,8 @@ co_result  co_yield_now(void *output, void **next_input);
  * 不必先 yield 回 caller 再 resume。不改 caller 鏈、不把 from 標成 CO_WAITING。
  *
  *   - READY／SUSPENDED／WAITING：允許（WAITING 用於喚醒停在 resume／transfer 的對方）
+ *   - WAITING 但其 resume 的 target 仍為 WAITING：INVALID_STATE
+ *     （禁止偷走外層 resume；先 hop 回直接 caller）
  *   - RUNNING（含 to == self）：ALREADY_RUNNING
  *   - DONE：FINISHED
  *   - 非 owner：WRONG_THREAD
@@ -214,12 +220,15 @@ co_result  co_destroy(coroutine *co);
  * 公開回收是本函式：跑完已登記的 defer（LIFO、恰好一次），再釋放控制塊
  * 與 mmap／VirtualAlloc 堆疊。與 orphan 安全網對齊，但是 owner 顯式呼叫。
  *
- * 凍結的協程框架隨 munmap 消失；凍結堆疊上未經 co_defer 登記的資源必然洩漏，且 ASan 無法偵測。
- * 不設 cancelling、不注入 CO_CANCEL、不把狀態推到 CO_DONE。回傳後 co 指標立即失效。
+ * 凍結的協程框架隨 munmap 消失；未經 co_defer 登記的資源不回收。
+ * 不設 cancelling、不注入 CO_CANCEL、不把狀態推到 CO_DONE（指標直接失效）。
  *
  *   - CO_READY／CO_DONE／CO_SUSPENDED：OK
  *   - CO_RUNNING：ALREADY_RUNNING（不可放棄正在執行的自己）
  *   - CO_WAITING：INVALID_STATE（巢狀鏈上，子協程仍會切回此外層）
+ *   - 仍是某條 WAITING 的 resume_target（外層 co_resume(co) 尚未返回）：
+ *     INVALID_STATE。SUSPENDED 不夠：A transfer 走後仍可能是 main 那次 resume 的
+ *     target；abandon 後 waiter 被喚醒會 UAF。須等該次 resume 返回再回收。
  *   - TLS main：INVALID_STATE
  *   - 非 owner：WRONG_THREAD
  *   - defer 執行中：INVALID_STATE

@@ -500,6 +500,14 @@ static co_transfer_t co_transfer_switch(struct coroutine *from,
     return t;
 }
 
+/* waiter 的 co_resume(target) 尚未返回，且 target 仍停在更內層 resume。
+ * 此時切到 waiter 會讓外層 resume 先返回，內層永遠卡在 WAITING。 */
+static int co_waiting_has_nested_resume(const struct coroutine *to)
+{
+    return to && to->resume_target &&
+           to->resume_target->state == CO_WAITING;
+}
+
 /* ------------------------------------------------------------------ *
  * allocator — 僅 struct coroutine；g_allocator 為 co_set_allocator 的副本
  * ------------------------------------------------------------------ */
@@ -679,7 +687,6 @@ void co_install_crash_handler(int enable)
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #  include <windows.h>
-#include "coroutine.h"
 
 static unsigned co_atomic_load_relaxed(unsigned *p)
 {
@@ -778,8 +785,28 @@ void co_trampoline_body(void)
     sink = self->caller;
     if (!sink)
         sink = &main_coroutine;
-    if (sink == self)
+    if (sink == self) {
+        fprintf(stderr,
+                "coroutine: fiber %p (function=%p) returned with sink==self; "
+                "cannot switch to a completed coroutine\n",
+                (void *)self, (void *)(uintptr_t)self->function);
+        fflush(stderr);
         abort();
+    }
+    /* 結束路徑沒有錯誤碼；跳到仍有內層 WAITING 的 waiter 會 strand */
+    if (co_waiting_has_nested_resume(sink)) {
+        struct coroutine *inner = sink->resume_target;
+
+        fprintf(stderr,
+                "coroutine: fiber %p (function=%p) returned while sink %p "
+                "still has nested co_resume(%p) in CO_WAITING; transferring "
+                "to the outer waiter would strand the inner resume. Yield or "
+                "co_transfer to the direct caller (%p) before returning.\n",
+                (void *)self, (void *)(uintptr_t)self->function,
+                (void *)sink, (void *)inner, (void *)inner);
+        fflush(stderr);
+        abort();
+    }
 
     (void)co_transfer_switch(self, sink, NULL);
     abort();    /* 已完成的協程不該被再次進入 */
@@ -865,6 +892,7 @@ co_result co_resume(coroutine *target, void *input, void **output)
 
     caller            = current_coroutine;
     caller->state     = CO_WAITING;
+    caller->resume_target = target;
     target->caller    = caller;
     target->state     = CO_RUNNING;
 
@@ -873,6 +901,7 @@ co_result co_resume(coroutine *target, void *input, void **output)
     if (output)
         *output = (target->state == CO_DONE) ? NULL : t.data;
     caller->state     = CO_RUNNING;
+    caller->resume_target = NULL;
     target->caller    = NULL;
 
     return CO_RESULT_OK;
@@ -930,6 +959,9 @@ co_result co_transfer(coroutine *to, void *data, co_transfer_t *out)
     if (to->state != CO_READY &&
         to->state != CO_SUSPENDED &&
         to->state != CO_WAITING)
+        return CO_RESULT_INVALID_STATE;
+    /* 不可喚醒「內層 resume 尚未返回」的 waiter（否則外層 resume 先返回） */
+    if (to->state == CO_WAITING && co_waiting_has_nested_resume(to))
         return CO_RESULT_INVALID_STATE;
 
     from->state = CO_SUSPENDED;
@@ -1062,6 +1094,11 @@ co_result co_abandon(coroutine *co)
         return CO_RESULT_ALREADY_RUNNING;
     /* 巢狀鏈上的 WAITING 仍會被切回；丟堆疊會讓子協程 resume 進已釋放的 context */
     if (co->state == CO_WAITING)
+        return CO_RESULT_INVALID_STATE;
+    /* 外層仍停在 co_resume(co)：其 stack 上的 target 指向本協程。
+     * 此時 abandon 會讓 waiter 被喚醒時 UAF（SUSPENDED 仍可能是 in-flight resume 的 target）。 */
+    if (co->caller && co->caller->state == CO_WAITING &&
+        co->caller->resume_target == co)
         return CO_RESULT_INVALID_STATE;
     if (co_is_main_coroutine(co))
         return CO_RESULT_INVALID_STATE;
