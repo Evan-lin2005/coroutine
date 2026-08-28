@@ -1,5 +1,5 @@
 /*
- * P3 test runner — stack pool reuse / cap / VMA.
+ * P3 test runner — stack pool reuse / cap / VMA（TSan 下改看 hit/miss/drop）。
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -17,6 +17,7 @@ void test_pool_over_cap(void);
 void test_pool_oversized_not_cached(void);
 void test_pool_vma_one_cached(void);
 void test_pool_thread_local(void);
+void test_pool_thread_exit_drain(void);
 
 static void run_one(const char *name, void (*fn)(void))
 {
@@ -47,6 +48,8 @@ int main(int argc, char **argv)
             run_all = 0, run_one("vma-cached", test_pool_vma_one_cached);
         if (strcmp(argv[i], "--thread") == 0)
             run_all = 0, run_one("thread-local", test_pool_thread_local);
+        if (strcmp(argv[i], "--thread-exit") == 0)
+            run_all = 0, run_one("thread-exit-drain", test_pool_thread_exit_drain);
     }
 
     if (run_all) {
@@ -56,6 +59,7 @@ int main(int argc, char **argv)
         run_one("oversized", test_pool_oversized_not_cached);
         run_one("vma-cached", test_pool_vma_one_cached);
         run_one("thread-local", test_pool_thread_local);
+        run_one("thread-exit-drain", test_pool_thread_exit_drain);
     }
 
     if (g_p0_failures) {

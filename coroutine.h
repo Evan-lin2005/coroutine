@@ -54,6 +54,8 @@ typedef struct coroutine coroutine;
  *     並依回傳處理（count>0 時應先 resume 至完成再結束執行緒）。
  *   - 若違反：thread exit 時庫會 reclaim 控制塊與 mmap／VirtualAlloc 堆疊
  *     （非「kill 協程」語意；callback 內未釋放的 C 物件視同 abort）。
+ *   - TLS stack pool 不掛 live list；thread-exit／atexit／co_thread_shutdown
+ *     仍會 drain，即使所有協程已 co_destroy。
  *   - orphan 警告僅計 CO_SUSPENDED／CO_WAITING／CO_RUNNING（與
  *     co_thread_shutdown 的 leaked_count 一致）；CO_DONE／CO_READY 靜默回收。
  *   - reclaim 後 coroutine* 失效（與 destroy 後 UAF 同類）。
@@ -341,6 +343,7 @@ size_t    co_defer_count(const coroutine *co);
  *     再結束執行緒，而非直接 exit
  *
  * leaked_count 可為 NULL（仍回傳上述結果碼）。
+ * 不論 leaked 與否，都會 drain 本執行緒 TLS stack pool。
  * 不 reclaim 掛起中協程（那是 thread-exit 安全網的路徑）。
  * defer 執行期間回 CO_RESULT_INVALID_STATE，不掃表（*leaked_count == 0）。
  */

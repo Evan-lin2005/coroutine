@@ -286,9 +286,8 @@ void test_orphan_shutdown_warns(void)
 #include <unistd.h>
 
 static coroutine *g_d1_co;
-static volatile int g_d1_step;
-static volatile int g_d1_ready;
-static volatile int g_d1_done;
+static int g_d1_step;
+static pthread_barrier_t g_d1_barrier;
 
 static void fn_d1_owner(coroutine *self, void *ud, void *in)
 {
@@ -306,21 +305,18 @@ static void *d1_owner_thread(void *arg)
     g_d1_co = co_create(CO_MIN_STACK_SIZE, fn_d1_owner, NULL);
     if (!g_d1_co) {
         g_p0_failures++;
-        g_d1_ready = 1;
+        pthread_barrier_wait(&g_d1_barrier);
+        pthread_barrier_wait(&g_d1_barrier);
         return NULL;
     }
     if (P0_RESUME(g_d1_co) != CO_RESULT_OK)
         g_p0_failures++;
     /* owner 仍存活：讓另一執行緒探測 WRONG_THREAD（避免 exit reclaim 造成 UAF） */
-    g_d1_ready = 1;
-    while (!g_d1_done) {
-        /* spin */
-    }
-    if (g_d1_co) {
-        (void)P0_RESUME(g_d1_co);
-        (void)co_destroy(g_d1_co);
-        g_d1_co = NULL;
-    }
+    pthread_barrier_wait(&g_d1_barrier);
+    pthread_barrier_wait(&g_d1_barrier);
+    (void)P0_RESUME(g_d1_co);
+    (void)co_destroy(g_d1_co);
+    g_d1_co = NULL;
     return NULL;
 }
 
@@ -328,10 +324,9 @@ static void *d1_reuse_thread(void *arg)
 {
     co_result r;
     (void)arg;
-    while (!g_d1_ready) {
-    }
+    pthread_barrier_wait(&g_d1_barrier);
     if (!g_d1_co) {
-        g_d1_done = 1;
+        pthread_barrier_wait(&g_d1_barrier);
         return NULL;
     }
     r = co_resume(g_d1_co, NULL, NULL);
@@ -339,7 +334,7 @@ static void *d1_reuse_thread(void *arg)
     p0_expect(__LINE__, "step still after first yield", g_d1_step, 1);
     r = co_destroy(g_d1_co);
     p0_expect(__LINE__, "cross-thread destroy", r, CO_RESULT_WRONG_THREAD);
-    g_d1_done = 1;
+    pthread_barrier_wait(&g_d1_barrier);
     return NULL;
 }
 
@@ -349,36 +344,44 @@ void test_owner_cross_generation(void)
 
     g_d1_step = 0;
     g_d1_co = NULL;
-    g_d1_ready = 0;
-    g_d1_done = 0;
 
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
            "start cross-thread owner test", "{}");
 
+    if (pthread_barrier_init(&g_d1_barrier, NULL, 2) != 0) {
+        g_p0_failures++;
+        return;
+    }
     if (pthread_create(&a, NULL, d1_owner_thread, NULL) != 0) {
+        pthread_barrier_destroy(&g_d1_barrier);
         g_p0_failures++;
         return;
     }
     if (pthread_create(&b, NULL, d1_reuse_thread, NULL) != 0) {
-        g_d1_done = 1;
+        pthread_barrier_wait(&g_d1_barrier);
+        pthread_barrier_wait(&g_d1_barrier);
         pthread_join(a, NULL);
+        pthread_barrier_destroy(&g_d1_barrier);
         g_p0_failures++;
         return;
     }
     pthread_join(b, NULL);
     pthread_join(a, NULL);
+    pthread_barrier_destroy(&g_d1_barrier);
 
     p0_log("D1", "test_lifecycle.c:test_owner_cross_generation",
            "cross-thread owner finished",
            g_p0_failures ? "{\"ok\":false}" : "{\"ok\":true}");
 }
 
+#if !CO_TEST_TSAN
 static void fn_orphan_return(coroutine *self, void *ud, void *in)
 {
     (void)self;
     (void)ud;
     (void)in;
 }
+#endif
 
 static void *orphan_exit_worker(void *arg)
 {
@@ -393,6 +396,7 @@ static void *orphan_exit_worker(void *arg)
     return NULL;
 }
 
+#if !CO_TEST_TSAN
 /* 1 SUSPENDED + 4 DONE + 4 READY；警告應只報 1，不是 live-list 長度 9 */
 static void *orphan_mixed_worker(void *arg)
 {
@@ -487,9 +491,14 @@ static int run_worker_capture_stderr(void *(*worker)(void *),
         return -1;
     return 0;
 }
+#endif /* !CO_TEST_TSAN */
 
 void test_orphan_warn_count(void)
 {
+#if CO_TEST_TSAN
+    fprintf(stderr, "SKIP orphan-warn-count: fork-based capture is unsupported under TSan\n");
+    return;
+#else
     char buf[2048];
 
     if (run_worker_capture_stderr(orphan_mixed_worker, buf, sizeof buf) != 0) {
@@ -523,6 +532,7 @@ void test_orphan_warn_count(void)
                 buf);
         g_p0_failures++;
     }
+#endif
 }
 
 static int run_orphan_exit_rounds(int rounds)
@@ -584,7 +594,12 @@ void test_orphan_thread_exit_reclaim(void)
         p0_log("D1b", "test_lifecycle.c:test_orphan_thread_exit_reclaim",
                "vma/rss after orphan exits", buf);
     }
-    /* 每個未 munmap 的協程堆疊至少 +1 VMA；允許極小雜訊。 */
+    /* 每個未 munmap 的協程堆疊至少 +1 VMA；允許極小雜訊。
+     * TSan 會為每個 pthread 留下 shadow／interceptor 映射，VMA 門檻無意義。 */
+#if CO_TEST_TSAN
+    (void)vma_growth;
+    fprintf(stderr, "SKIP orphan-exit VMA: TSan mappings dwarf stack VMAs\n");
+#else
     if (vma0 >= 0 && vma1 >= 0 && vma_growth > VMA_SLACK) {
         fprintf(stderr,
                 "FAIL orphan reclaim: VMA growth %ld after %d exits "
@@ -592,6 +607,7 @@ void test_orphan_thread_exit_reclaim(void)
                 vma_growth, N, vma0, vma1, rss_growth);
         g_p0_failures++;
     }
+#endif
 
     co = co_create(CO_MIN_STACK_SIZE, fn_mass, &v);
     if (!co) {

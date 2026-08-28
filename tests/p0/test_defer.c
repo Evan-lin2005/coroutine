@@ -430,6 +430,7 @@ void test_defer_orphan_reclaim(void)
     p0_expect(__LINE__, "orphan ran defer", g_defer_runs, 1);
 }
 
+#if !CO_TEST_TSAN
 static int run_main_atexit_capture(char *buf, size_t buf_sz)
 {
     int pipefd[2];
@@ -479,9 +480,14 @@ static int run_main_atexit_capture(char *buf, size_t buf_sz)
         return -1;
     return 0;
 }
+#endif
 
 void test_defer_main_atexit(void)
 {
+#if CO_TEST_TSAN
+    fprintf(stderr, "SKIP defer-atexit: fork-based capture is unsupported under TSan\n");
+    return;
+#else
     char buf[2048];
 
     if (run_main_atexit_capture(buf, sizeof buf) != 0) {
@@ -495,6 +501,7 @@ void test_defer_main_atexit(void)
                 buf);
         g_p0_failures++;
     }
+#endif
 }
 
 /*

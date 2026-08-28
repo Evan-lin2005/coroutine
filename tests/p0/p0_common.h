@@ -10,6 +10,17 @@
 
 extern int g_p0_failures;
 
+#ifdef __SANITIZE_THREAD__
+#  define CO_TEST_TSAN 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_TEST_TSAN 1
+#  endif
+#endif
+#ifndef CO_TEST_TSAN
+#  define CO_TEST_TSAN 0
+#endif
+
 /* resume/yield：無傳值時傳 NULL */
 #define P0_RESUME(co)             co_resume((co), NULL, NULL)
 #define P0_RESUME_IN(co, input)   co_resume((co), (input), NULL)

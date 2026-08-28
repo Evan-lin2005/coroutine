@@ -21,6 +21,7 @@ static void fn_nop(coroutine *self, void *ud, void *in)
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if !CO_TEST_TSAN
 /* fork 子行程：確認極端 size 回錯誤碼而非 crash */
 static int create_ex_in_child(size_t sz, co_result *out_r)
 {
@@ -58,7 +59,8 @@ static int create_ex_in_child(size_t sz, co_result *out_r)
         *out_r = rbuf;
     return 0;
 }
-#endif
+#endif /* !CO_TEST_TSAN */
+#endif /* linux/apple */
 
 void test_stack_bounds(void)
 {
@@ -83,6 +85,12 @@ void test_stack_bounds(void)
     }
 
 #if defined(__linux__) || defined(__APPLE__)
+#if CO_TEST_TSAN
+    r = co_create_ex(SIZE_MAX, fn_nop, NULL, &co);
+    p0_expect(__LINE__, "SIZE_MAX invalid", r, CO_RESULT_INVALID_ARGUMENT);
+    r = co_create_ex(SIZE_MAX - 4094, fn_nop, NULL, &co);
+    p0_expect(__LINE__, "SIZE_MAX-4094 invalid", r, CO_RESULT_INVALID_ARGUMENT);
+#else
     {
         co_result child_r = (co_result)-1;
         int sig;
@@ -107,6 +115,7 @@ void test_stack_bounds(void)
                       CO_RESULT_INVALID_ARGUMENT);
         }
     }
+#endif
 #else
     r = co_create_ex(SIZE_MAX, fn_nop, NULL, &co);
     p0_expect(__LINE__, "SIZE_MAX invalid", r, CO_RESULT_INVALID_ARGUMENT);

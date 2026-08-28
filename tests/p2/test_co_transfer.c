@@ -90,6 +90,54 @@ void test_sibling_hop(void)
     p0_expect(__LINE__, "abandon B", co_abandon(g_peer_b), CO_RESULT_OK);
 }
 
+static void fn_abandon_inflight_b(coroutine *self, void *ud, void *in)
+{
+    co_transfer_t t;
+
+    (void)self;
+    (void)ud;
+    (void)in;
+    p0_expect(__LINE__, "abandon A while resume in flight",
+              co_abandon(g_peer_a), CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "B transfer main",
+              co_transfer(g_main, &msg_bm, &t), CO_RESULT_OK);
+}
+
+static void fn_abandon_inflight_a(coroutine *self, void *ud, void *in)
+{
+    co_transfer_t t;
+
+    (void)self;
+    (void)ud;
+    (void)in;
+    p0_expect(__LINE__, "A transfer B",
+              co_transfer(g_peer_b, &msg_ab, &t), CO_RESULT_OK);
+}
+
+void test_abandon_in_flight_resume(void)
+{
+    void *output = NULL;
+
+    g_main = co_current();
+    g_peer_a = co_create(CO_MIN_STACK_SIZE, fn_abandon_inflight_a, NULL);
+    g_peer_b = co_create(CO_MIN_STACK_SIZE, fn_abandon_inflight_b, NULL);
+    if (!g_peer_a || !g_peer_b) {
+        g_p0_failures++;
+        if (g_peer_a)
+            (void)co_abandon(g_peer_a);
+        if (g_peer_b)
+            (void)co_abandon(g_peer_b);
+        return;
+    }
+
+    p0_expect(__LINE__, "resume A",
+              co_resume(g_peer_a, NULL, &output), CO_RESULT_OK);
+    p0_expect_ptr(__LINE__, "output from B", output, &msg_bm);
+    p0_expect(__LINE__, "abandon A after resume returned",
+              co_abandon(g_peer_a), CO_RESULT_OK);
+    p0_expect(__LINE__, "abandon B", co_abandon(g_peer_b), CO_RESULT_OK);
+}
+
 static void fn_first_entry(coroutine *self, void *ud, void *in)
 {
     (void)ud;
@@ -182,6 +230,132 @@ void test_transfer_to_waiting(void)
     p0_expect(__LINE__, "finished", co_finished(co), 1);
     p0_expect_ptr(__LINE__, "done output null", output, NULL);
     p0_expect(__LINE__, "destroy", co_destroy(co), CO_RESULT_OK);
+}
+
+static coroutine *g_nest_main;
+static coroutine *g_nest_a;
+static coroutine *g_nest_b;
+static coroutine *g_nest_c;
+static int g_steal_rc;
+
+static void fn_nested_steal_b(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_steal_rc = (int)co_transfer(g_nest_main, NULL, NULL);
+    p0_expect(__LINE__, "steal outer resume rejected",
+              g_steal_rc, (int)CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "yield back to A",
+              co_yield_now(NULL, NULL), CO_RESULT_OK);
+}
+
+static void fn_nested_steal_a(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_nest_b = co_create(CO_MIN_STACK_SIZE, fn_nested_steal_b, NULL);
+    if (!g_nest_b) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "A resume B",
+              co_resume(g_nest_b, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "B not finished after rejected steal",
+              co_finished(g_nest_b), 0);
+    p0_expect(__LINE__, "A resume B finish",
+              co_resume(g_nest_b, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "B finished", co_finished(g_nest_b), 1);
+    p0_expect(__LINE__, "destroy B", co_destroy(g_nest_b), CO_RESULT_OK);
+}
+
+void test_nested_steal_rejected(void)
+{
+    g_steal_rc = -999;
+    g_nest_main = co_current();
+    g_nest_a = co_create(CO_MIN_STACK_SIZE, fn_nested_steal_a, NULL);
+    if (!g_nest_a) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "P resume A",
+              co_resume(g_nest_a, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "steal rc from B",
+              g_steal_rc, (int)CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "A finished", co_finished(g_nest_a), 1);
+    p0_expect(__LINE__, "destroy A", co_destroy(g_nest_a), CO_RESULT_OK);
+}
+
+static void fn_indirect_steal_c(coroutine *self, void *ud, void *in)
+{
+    co_transfer_t t;
+
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_steal_rc = (int)co_transfer(g_nest_main, NULL, NULL);
+    p0_expect(__LINE__, "indirect steal rejected",
+              g_steal_rc, (int)CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "C transfer back to B",
+              co_transfer(g_nest_b, NULL, &t), CO_RESULT_OK);
+}
+
+static void fn_indirect_steal_b(coroutine *self, void *ud, void *in)
+{
+    co_transfer_t t;
+
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_nest_c = co_create(CO_MIN_STACK_SIZE, fn_indirect_steal_c, NULL);
+    if (!g_nest_c) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "B transfer C",
+              co_transfer(g_nest_c, NULL, &t), CO_RESULT_OK);
+    p0_expect(__LINE__, "yield back to A",
+              co_yield_now(NULL, NULL), CO_RESULT_OK);
+}
+
+static void fn_indirect_steal_a(coroutine *self, void *ud, void *in)
+{
+    (void)self;
+    (void)ud;
+    (void)in;
+    g_nest_b = co_create(CO_MIN_STACK_SIZE, fn_indirect_steal_b, NULL);
+    if (!g_nest_b) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "A resume B",
+              co_resume(g_nest_b, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "C parked after rejected steal",
+              co_finished(g_nest_c), 0);
+    p0_expect(__LINE__, "abandon C", co_abandon(g_nest_c), CO_RESULT_OK);
+    p0_expect(__LINE__, "A resume B finish",
+              co_resume(g_nest_b, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "B finished", co_finished(g_nest_b), 1);
+    p0_expect(__LINE__, "destroy B", co_destroy(g_nest_b), CO_RESULT_OK);
+}
+
+void test_indirect_steal_rejected(void)
+{
+    g_steal_rc = -999;
+    g_nest_c = NULL;
+    g_nest_main = co_current();
+    g_nest_a = co_create(CO_MIN_STACK_SIZE, fn_indirect_steal_a, NULL);
+    if (!g_nest_a) {
+        g_p0_failures++;
+        return;
+    }
+    p0_expect(__LINE__, "P resume A",
+              co_resume(g_nest_a, NULL, NULL), CO_RESULT_OK);
+    p0_expect(__LINE__, "indirect steal rc",
+              g_steal_rc, (int)CO_RESULT_INVALID_STATE);
+    p0_expect(__LINE__, "A finished", co_finished(g_nest_a), 1);
+    p0_expect(__LINE__, "destroy A", co_destroy(g_nest_a), CO_RESULT_OK);
 }
 
 static void fn_instant_done(coroutine *self, void *ud, void *in)
