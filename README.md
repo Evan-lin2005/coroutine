@@ -1,5 +1,7 @@
 # Coroutine — 可嵌入的 C Fiber Primitive
 
+介紹頁：[https://evan-lin2005.github.io/coroutine/](https://evan-lin2005.github.io/coroutine/)
+
 精簡的 **非對稱（asymmetric）** 協程庫，目標演進為可嵌入的 C fiber primitive：先確保切換正確性與嵌入鉤子，再以對稱 `transfer` 為底層原語，堆疊密度以 TLS private-stack pool 為終點（不採 shared copy-stack）。
 
 詳細路線圖見 [Plan.md](Plan.md)。
@@ -157,6 +159,7 @@ tests/p1/                     P1 mailbox / storage / allocator / CLS
 tests/p2/                     P2 co_transfer 正確性測與 hop bench
 tests/p3/                     P3a stack pool 測與 cap 對照 bench
 test_coroutine.c              基本功能 / 壓力測
+docs/                         GitHub Pages（Jekyll）
 Plan.md                       路線圖（P0–P3 + D-1..D-7）
 ```
 
