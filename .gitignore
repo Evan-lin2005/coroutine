@@ -1,0 +1,24 @@
+# Objects and TSan preinit stub
+*.o
+.tsan-preinit/
+
+# Test / bench binaries
+/test_p0
+/test_p1
+/test_p2
+/test_p3
+/test_coroutine
+/test_coroutine.exe
+/test_coroutine_*
+/bench_hop
+/bench_switch
+/bench_pool_perclass
+/bench_pool_global
+/tests/boundary/test_boundary_crash
+
+# Local logs
+*.log
+stderr.txt
+stdout.txt
+d4_step*.txt
+*_verify_result.txt

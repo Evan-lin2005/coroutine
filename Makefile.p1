@@ -5,6 +5,8 @@ CC      ?= gcc
 CFLAGS  = -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -Itests/p0 -Itests/p1
 LDFLAGS = -pthread
 
+include Makefile.tsan.inc
+
 LIB_C   = coroutine.c platform/Linux_x86/SystemV.c
 LIB_ASM = platform/Linux_x86/sysV.S
 LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
@@ -13,7 +15,7 @@ P1_SRCS = tests/p0/p0_common.c tests/p1/test_p1_main.c tests/p1/test_transfer.c 
           tests/p1/test_storage.c tests/p1/test_allocator.c tests/p1/test_cls.c
 P1_OBJS = $(P1_SRCS:.c=.o)
 
-.PHONY: all test clean libobjs
+.PHONY: all test clean libobjs test-tsan
 
 all: test_p1
 
@@ -23,6 +25,15 @@ test_p1: $(LIB_OBJ) $(P1_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P1_OBJS) $(LDFLAGS)
 
 test: test_p1
+	./test_p1
+	./test_p1 --cls-alloc-race
+
+test-tsan:
+	$(MAKE) -f Makefile.p1 clean
+	$(MAKE) -f Makefile.p1 tsan-preinit
+	$(MAKE) -f Makefile.p1 test_p1 \
+		CFLAGS='$(CFLAGS) $(TSAN_CFLAGS)' \
+		LDFLAGS='$(LDFLAGS) $(TSAN_LDFLAGS)'
 	./test_p1
 	./test_p1 --cls-alloc-race
 
@@ -40,3 +51,4 @@ platform/Linux_x86/%.o: platform/Linux_x86/%.S
 
 clean:
 	rm -f $(LIB_OBJ) $(P1_OBJS) test_p1
+	rm -rf $(TSAN_PREINIT_DIR)

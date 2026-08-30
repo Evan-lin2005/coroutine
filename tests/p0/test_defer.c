@@ -508,7 +508,7 @@ void test_defer_main_atexit(void)
  * D-10 ASan 負向測：READY 預登已結束的 caller local，co_destroy 路徑應報
  * stack-use-after-return。非 ASan 建置 SKIP（不會 abort）。
  */
-#if defined(__SANITIZE_ADDRESS__)
+#if CO_TEST_ASAN
 
 static void defer_touch_uar(void *p)
 {
@@ -601,7 +601,7 @@ void test_defer_asan_uar_destroy(void)
 #endif
 }
 
-#else /* !__SANITIZE_ADDRESS__ */
+#else /* !CO_TEST_ASAN */
 
 void test_defer_asan_uar_destroy(void)
 {

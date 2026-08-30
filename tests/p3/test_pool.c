@@ -52,7 +52,7 @@ static int create_run_destroy(size_t stack)
     return 0;
 }
 
-#if defined(__linux__) && !CO_TEST_TSAN
+#if defined(__linux__) && !CO_TEST_TSAN && !CO_TEST_ASAN
 static long read_vma_count(void)
 {
     FILE *f = fopen("/proc/self/maps", "r");
@@ -158,11 +158,11 @@ void test_pool_oversized_not_cached(void)
         g_p0_failures++;
         return;
     }
-#if CO_TEST_TSAN
+#if CO_TEST_TSAN || CO_TEST_ASAN
     {
         unsigned long long hit = 0, miss = 0, drop = 0;
 
-        /* TSan shadow 映射會撐破 /proc/self/maps；改看池計數。 */
+        /* sanitizer shadow 映射會撐破 /proc/self/maps；改看池計數。 */
         co_pool_debug_stats_reset();
         if (create_run_destroy(big) != 0) {
             g_p0_failures++;
@@ -170,7 +170,7 @@ void test_pool_oversized_not_cached(void)
         }
         co_pool_debug_stats(&hit, &miss, &drop);
         (void)miss;
-        /* >512KiB 不進池：不會 hit；destroy 走 drop（munmap）。 */
+        /* >512KiB 不進池（ASan 建置亦整池關閉）：不會 hit；destroy 走 drop。 */
         if (hit != 0 || drop < 1) {
             fprintf(stderr,
                     "FAIL oversized pool: hit=%llu drop=%llu "
@@ -208,7 +208,7 @@ void test_pool_vma_one_cached(void)
 {
     (void)co_thread_shutdown(NULL);
     (void)co_current();
-#if CO_TEST_TSAN
+#if CO_TEST_TSAN || CO_TEST_ASAN
     {
         enum { N = 8 };
         unsigned long long hit = 0, miss = 0, drop = 0;
@@ -228,8 +228,23 @@ void test_pool_vma_one_cached(void)
                      "{\"n\":%d,\"hit\":%llu,\"miss\":%llu,\"drop\":%llu}",
                      N, hit, miss, drop);
             p0_log("P3", "test_pool.c:test_pool_vma_one_cached",
+#if CO_TEST_ASAN
+                   "sequential reuse pool stats (ASan, pool off)", buf);
+#else
                    "sequential reuse pool stats (TSan)", buf);
+#endif
         }
+#if CO_TEST_ASAN
+        /* ASan 建置不進池：每次 mmap + munmap。 */
+        if (hit != 0 || miss != (unsigned long long)N ||
+            drop != (unsigned long long)N) {
+            fprintf(stderr,
+                    "FAIL pool cache stats hit=%llu miss=%llu drop=%llu "
+                    "(ASan: want hit=0 miss=%d drop=%d)\n",
+                    hit, miss, drop, N, N);
+            g_p0_failures++;
+        }
+#else
         /* 空池第一次 mmap（miss），其後 N-1 次 hit；未滿 cap 不 drop。 */
         if (hit != (unsigned long long)(N - 1) || miss != 1 || drop != 0) {
             fprintf(stderr,
@@ -238,6 +253,7 @@ void test_pool_vma_one_cached(void)
                     hit, miss, drop, N - 1);
             g_p0_failures++;
         }
+#endif
     }
 #elif defined(__linux__)
     {
@@ -362,10 +378,10 @@ void test_pool_thread_exit_drain(void)
 #if defined(_WIN32)
     p0_log("P3", "test_pool.c:test_pool_thread_exit_drain",
            "skipped on Windows", "{}");
-#elif CO_TEST_TSAN
+#elif CO_TEST_TSAN || CO_TEST_ASAN
     if (run_pool_exit_rounds(4) != 0)
         g_p0_failures++;
-    fprintf(stderr, "SKIP pool-exit VMA: TSan mappings dwarf stack VMAs\n");
+    fprintf(stderr, "SKIP pool-exit VMA: sanitizer mappings dwarf stack VMAs\n");
 #elif defined(__linux__)
     enum { WARMUP = 4, N = 20, VMA_SLACK = 2 };
     long vma0, vma1, growth;

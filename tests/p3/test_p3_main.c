@@ -1,5 +1,5 @@
 /*
- * P3 test runner — stack pool reuse / cap / VMA（TSan 下改看 hit/miss/drop）。
+ * P3 test runner — stack pool reuse / cap / VMA（ASan／TSan 下改看 hit/miss/drop）。
  */
 
 #ifndef _POSIX_C_SOURCE

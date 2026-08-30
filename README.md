@@ -1,6 +1,6 @@
 # Coroutine — 可嵌入的 C Fiber Primitive
 
-精簡的 **非對稱（asymmetric）** 協程庫，目標演進為可嵌入的 C fiber primitive：先確保切換正確性與嵌入鉤子，再以對稱 `transfer` 為底層原語，最後才做堆疊密度優化。
+精簡的 **非對稱（asymmetric）** 協程庫，目標演進為可嵌入的 C fiber primitive：先確保切換正確性與嵌入鉤子，再以對稱 `transfer` 為底層原語，堆疊密度以 TLS private-stack pool 為終點（不採 shared copy-stack）。
 
 詳細路線圖見 [Plan.md](Plan.md)。
 
@@ -12,24 +12,27 @@
 | **P1** 嵌入鉤子 | mailbox 傳值、custom allocator、storage、`co_current`、CLS | **完成** |
 | **D-1..D-7** | `owner_id`、orphan shutdown、stack bounds、opt-in crash handler、ASan bounds/fake_stack、atomic `page_size`、非淘汰 guard 表 | **完成** |
 | **D-9** 合作式取消 | `co_cancel` + `CO_CANCEL` sentinel；`CANCEL_IGNORED` | **完成** |
-| **P2** 對稱原語 | `co_transfer`；resume/yield 建其上；TSan fiber；外部 stack 公開決策 | 待做 |
-| **P3** 密度 | stack pool → shared copy-stack | 待做 |
+| **P2** 對稱原語 | `co_transfer`；resume/yield 建其上；拒絕巢狀 WAITING steal／in-flight abandon；TSan fiber 註解 | **完成** |
+| **P3a** stack pool | size class LIFO；create 取池、destroy 還池；ASan／超大／external 不進池 | **完成** |
+| **P3b** copy-stack | shared stack + suspend 時 copy-out | **放棄** |
 
-公開 API 為非對稱 `co_resume` / `co_yield_now`（mailbox 傳值）、可選 storage、CLS、`co_current`、custom allocator、`co_thread_shutdown`、opt-in crash handler。P0/P1 與 D-1..D-7 契約已補齊回歸測試。
+公開 API 為非對稱 `co_resume` / `co_yield_now`（mailbox 傳值）、對稱 `co_transfer`、可選 storage、CLS、`co_current`、custom allocator、`co_thread_shutdown`、opt-in crash handler。P0/P1/P2/P3a 與 D-1..D-7 契約已補齊回歸測試。
 
 ## 功能摘要
 
 - **合作式取消**：`co_cancel` 只把協程推到 `CO_DONE`（READY 回 `CANCEL_NOT_STARTED`），回收一律 `co_destroy`。違約 yield → `CANCEL_IGNORED`；再次 `co_cancel` 不注入 sentinel。查詢用 `co_cancel_requested`
-- **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)`
+- **對稱切換**：`co_transfer(to, data, out)` 兄弟 hop；不可偷走仍有內層 `WAITING` 的外層 resume；不可 abandon 尚未返回的 resume target
+- **Mailbox 傳值**：`co_resume(co, input, output)` / `co_yield_now(output, next_input)` / `co_transfer` 共用同一信箱
 - **CLS**：`co_cls_alloc` / `co_cls_set` / `co_cls_get`（process-global key、per-coroutine value）
 - **可選 storage**：`co_set_storage` / `co_storage`（呼叫端自有 buffer）
 - **Custom allocator**：`co_set_allocator`（控制塊配置；create 時快照）
-- **獨立堆疊**：每協程 `mmap` / `VirtualAlloc`，雙端 guard page；大小 `CO_MIN_STACK_SIZE`‥`CO_MAX_STACK_SIZE`（1 GiB）
+- **獨立堆疊**：每協程 `mmap` / `VirtualAlloc`，雙端 guard page；大小 `CO_MIN_STACK_SIZE`‥`CO_MAX_STACK_SIZE`（1 GiB）。銷毀後依 size class 進 TLS pool（預設每檔 8 塊），下次 create 重用；ASan 建置與 >512KiB 不進池
 - **巢狀 resume**：外層進入 `CO_WAITING`，禁止對同一協程重入或銷毀
 - **執行緒親和**：`owner_id` 為 process 生命週期單調序號（非 TLS 位址）；不可跨執行緒 mutating API
 - **執行緒結束**：`co_thread_shutdown` 為 caller 義務入口；未清理時 thread-exit 會 orphan reclaim 庫資源
 - **Guard 溢位診斷**：預設嵌入友善（不安裝 handler）；`co_install_crash_handler(1)` 才啟用；表滿（4096）時不淘汰舊條目，新堆疊可能缺診斷
 - **ASan fiber 註解**：主協程邊界來自 `co_platform_query_thread_stack`；`asan_fake_stack` 支援 `-fsanitize=address` 下 use-after-return
+- **TSan fiber 註解**：`-fsanitize=thread` 下 create／switch／destroy 接 LLVM fiber API；非 sanitizer 建置零開銷
 - **可選堆疊用量偵測**：`-DCO_DEBUG_STACK_USAGE` 啟用 `co_stack_peak`
 
 ## 支援平台
@@ -55,6 +58,11 @@ make          # 建置 test_coroutine
 make test     # 基本 suite（--speed normal）
 make p0       # P0 正確性測 + bench（Makefile.p0）
 make p0-asan  # ASan 下跑 P0 suite
+make p0-tsan  # TSan 下跑 P0 suite（fork／regs／guard SKIP）
+make p1-tsan  # TSan 下跑 P1 suite（含 --cls-alloc-race）
+make p2-tsan  # TSan 下跑 P2 suite
+make p3       # P3a stack pool 測（Makefile.p3）
+make p3-tsan  # TSan 下跑 P3 池測（VMA 改看 hit/miss/drop）
 make bench    # 空 yield/resume，報 cycles/switch
 ```
 
@@ -146,6 +154,8 @@ co_context.h                  平台 context 聚合
 platform/                     各架構 asm + stack 實作
 tests/p0/                     P0 正確性測與 bench_switch
 tests/p1/                     P1 mailbox / storage / allocator / CLS
+tests/p2/                     P2 co_transfer 正確性測與 hop bench
+tests/p3/                     P3a stack pool 測與 cap 對照 bench
 test_coroutine.c              基本功能 / 壓力測
 Plan.md                       路線圖（P0–P3 + D-1..D-7）
 ```
@@ -158,7 +168,16 @@ Plan.md                       路線圖（P0–P3 + D-1..D-7）
 | `make -f Makefile.p0 test` | callee-saved 暫存器、guard 溢位、巢狀深度、大量生命週期、`CO_WAITING` 重入 |
 | `make -f Makefile.p0 bench` | 空切換 throughput / cycles/switch |
 | `make p0-asan` | ASan build 跑 P0（`test_regs` 在 ASan 下會 SKIP，其餘應通過） |
+| `make -f Makefile.p0 test-tsan` | TSan 跑 P0（fork／regs／guard SKIP） |
 | `make -f Makefile.p1 test` | P1 mailbox、storage、allocator、CLS（含 `--cls-alloc-race` 獨立 process） |
+| `make -f Makefile.p1 test-tsan` | TSan 跑 P1（含 CLS alloc race） |
+| `make -f Makefile.p2 test` | P2 `co_transfer` sibling hop、WAITING steal、in-flight abandon |
+| `make -f Makefile.p2 test-tsan` | TSan 跑 P2 transfer／steal |
+| `make -f Makefile.p2 bench` | hop 對照：`main_yield`／`sched_main`／`nested_resume`／`transfer` |
+| `make -f Makefile.p3 test` | P3a pool：sequential reuse、cap、oversized、VMA、thread-local |
+| `make -f Makefile.p3 test-asan` | ASan 跑 P3（池關閉；改看 hit／miss／drop） |
+| `make -f Makefile.p3 test-tsan` | TSan 跑 P3（VMA 改看 hit／miss／drop） |
+| `make -f Makefile.p3 compare-pool` | per-class 8 塊 vs 全池合計 8 塊 |
 
 P0 可單獨跑：
 
@@ -173,8 +192,10 @@ P0 可單獨跑：
 1. **P0（已完成）** — 切換與堆疊契約有可回歸證據
 2. **P1（已完成）** — mailbox 傳值、allocator、storage、`co_current`、CLS
 3. **D-1..D-7（已完成）** — owner／shutdown、stack bounds、opt-in handler、ASan、page_size、guard 表
-4. **P2** — `co_transfer` 為底層；TSan fiber；鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
-5. **P3** — stack pool，再可選 shared copy-stack（禁巢狀、高風險）
+4. **P2（已完成）** — `co_transfer` 為底層；拒絕巢狀 WAITING steal 與 in-flight abandon；TSan fiber 註解
+5. **P2 後續** — 鎖定外部 stack 公開 API（建議 `co_create_with_stack`）
+6. **P3a（已完成）** — TLS size class stack pool；公開 API 不變
+7. **P3b（已放棄）** — 不實作 shared copy-stack；堆疊模型維持 private stack
 
 ### 刻意不做
 
@@ -183,6 +204,7 @@ P0 可單獨跑：
 - C++ 例外穿越 / 自動 unwind destroy
 - AArch64 保存 FPCR/FPSR
 - 公開 API 使用 C++20 coroutine 關鍵字（`co_yield` / `co_await` / `co_return`）
+- shared copy-stack（`CO_STACK_SHARE`、suspend copy-out）
 
 ## 授權
 

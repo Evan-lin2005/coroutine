@@ -15,3 +15,19 @@ jobs:
         run: make -f Makefile.p0 test-ndebug
       - name: P1 tests
         run: make -f Makefile.p1 test
+      - name: P2 tests
+        run: make -f Makefile.p2 test
+      - name: P3 tests
+        run: make -f Makefile.p3 test
+      - name: P0 tests (ASan)
+        run: make -f Makefile.p0 test-asan
+      - name: P3 tests (ASan)
+        run: make -f Makefile.p3 test-asan
+      - name: P0 tests (TSan)
+        run: make -f Makefile.p0 test-tsan
+      - name: P1 tests (TSan)
+        run: make -f Makefile.p1 test-tsan
+      - name: P2 tests (TSan)
+        run: make -f Makefile.p2 test-tsan
+      - name: P3 tests (TSan)
+        run: make -f Makefile.p3 test-tsan

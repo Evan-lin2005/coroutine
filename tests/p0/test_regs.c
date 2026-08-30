@@ -130,7 +130,7 @@ static void fn_regs_x86(coroutine *self, void *userdata, void *initial_input)
 
 void test_regs(void)
 {
-#if defined(__SANITIZE_ADDRESS__) || CO_TEST_TSAN
+#if CO_TEST_ASAN || CO_TEST_TSAN
     fprintf(stderr, "SKIP test_regs: inline asm callee-saved probe conflicts with ASan/TSan instrumentation\n");
     p0_log("H1", "test_regs.c:test_regs", "skipped under ASan/TSan", "{}");
     return;
@@ -308,7 +308,7 @@ static void fn_regs_a64(coroutine *self, void *userdata, void *initial_input)
 
 void test_regs(void)
 {
-#if defined(__SANITIZE_ADDRESS__) || CO_TEST_TSAN
+#if CO_TEST_ASAN || CO_TEST_TSAN
     fprintf(stderr, "SKIP test_regs: inline asm callee-saved probe conflicts with ASan/TSan instrumentation\n");
     p0_log("H1", "test_regs.c:test_regs", "skipped under ASan/TSan", "{}");
     return;
@@ -358,7 +358,7 @@ void test_regs(void)
 
 void test_regs(void)
 {
-#if defined(__SANITIZE_ADDRESS__) || CO_TEST_TSAN
+#if CO_TEST_ASAN || CO_TEST_TSAN
     fprintf(stderr, "SKIP test_regs: inline asm callee-saved probe conflicts with ASan/TSan instrumentation\n");
     p0_log("H1", "test_regs.c:test_regs", "skipped under ASan/TSan", "{}");
     return;

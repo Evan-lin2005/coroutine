@@ -1,0 +1,58 @@
+# P2 transfer primitive tests
+# Usage: make -f Makefile.p2 [test|clean]
+
+CC      ?= gcc
+CFLAGS  = -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -Itests/p0 -Itests/p2
+LDFLAGS = -pthread
+ASFLAGS = $(CFLAGS) -fcf-protection=branch
+
+include Makefile.tsan.inc
+
+LIB_C   = coroutine.c platform/Linux_x86/SystemV.c
+LIB_ASM = platform/Linux_x86/sysV.S
+LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
+
+P2_SRCS = tests/p0/p0_common.c tests/p2/test_p2_main.c tests/p2/test_co_transfer.c
+P2_OBJS = $(P2_SRCS:.c=.o)
+
+.PHONY: all test bench clean libobjs test-tsan
+
+all: test_p2 bench_hop
+
+libobjs: $(LIB_OBJ)
+
+test_p2: $(LIB_OBJ) $(P2_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P2_OBJS) $(LDFLAGS)
+
+test: test_p2
+	./test_p2
+
+test-tsan:
+	$(MAKE) -f Makefile.p2 clean
+	$(MAKE) -f Makefile.p2 tsan-preinit
+	$(MAKE) -f Makefile.p2 test_p2 \
+		CFLAGS='$(CFLAGS) $(TSAN_CFLAGS)' \
+		LDFLAGS='$(LDFLAGS) $(TSAN_LDFLAGS)'
+	./test_p2
+
+bench_hop: $(LIB_OBJ) tests/p2/bench_hop.o
+	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) tests/p2/bench_hop.o $(LDFLAGS)
+
+bench: bench_hop
+	./bench_hop --iter=300000 --repeat=5
+
+tests/p2/%.o: tests/p2/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+tests/p0/%.o: tests/p0/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+platform/Linux_x86/%.o: platform/Linux_x86/%.S
+	$(CC) $(ASFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(LIB_OBJ) $(P2_OBJS) tests/p2/bench_hop.o test_p2 bench_hop
+	rm -rf $(TSAN_PREINIT_DIR)

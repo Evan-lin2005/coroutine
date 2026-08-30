@@ -595,10 +595,10 @@ void test_orphan_thread_exit_reclaim(void)
                "vma/rss after orphan exits", buf);
     }
     /* 每個未 munmap 的協程堆疊至少 +1 VMA；允許極小雜訊。
-     * TSan 會為每個 pthread 留下 shadow／interceptor 映射，VMA 門檻無意義。 */
-#if CO_TEST_TSAN
+     * ASan／TSan shadow／interceptor 映射會撐破 VMA 門檻。 */
+#if CO_TEST_TSAN || CO_TEST_ASAN
     (void)vma_growth;
-    fprintf(stderr, "SKIP orphan-exit VMA: TSan mappings dwarf stack VMAs\n");
+    fprintf(stderr, "SKIP orphan-exit VMA: sanitizer mappings dwarf stack VMAs\n");
 #else
     if (vma0 >= 0 && vma1 >= 0 && vma_growth > VMA_SLACK) {
         fprintf(stderr,

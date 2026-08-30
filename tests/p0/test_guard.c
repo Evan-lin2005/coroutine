@@ -24,7 +24,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_ADDRESS__)
+#if CO_TEST_ASAN
 void test_guard_overflow(void)
 {
     fprintf(stderr,
