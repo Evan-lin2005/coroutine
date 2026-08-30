@@ -1,0 +1,16 @@
+title: Coroutine
+description: 可嵌入的 C Fiber Primitive
+url: https://evan-lin2005.github.io
+baseurl: /coroutine
+theme: jekyll-theme-cayman
+show_downloads: true
+permalink: pretty
+markdown: kramdown
+highlighter: rouge
+plugins:
+  - jekyll-seo-tag
+github:
+  is_project_page: true
+  repository_url: https://github.com/Evan-lin2005/coroutine
+  zip_url: https://github.com/Evan-lin2005/coroutine/archive/refs/heads/master.zip
+  tar_url: https://github.com/Evan-lin2005/coroutine/archive/refs/heads/master.tar.gz
