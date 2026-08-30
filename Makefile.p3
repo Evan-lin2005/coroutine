@@ -1,0 +1,87 @@
+# P3 stack-pool tests
+# Usage: make -f Makefile.p3 [test|test-asan|test-tsan|bench|compare-pool|clean]
+
+CC      ?= gcc
+CFLAGS  = -std=c17 -Wall -Wextra -Werror -O2 -g -I. -Iplatform/Linux_x86 -Itests/p0
+LDFLAGS = -pthread
+ASFLAGS = $(CFLAGS) -fcf-protection=branch
+
+include Makefile.tsan.inc
+
+LIB_C   = coroutine.c platform/Linux_x86/SystemV.c
+LIB_ASM = platform/Linux_x86/sysV.S
+LIB_OBJ = $(LIB_C:.c=.o) $(LIB_ASM:.S=.o)
+
+P3_SRCS = tests/p0/p0_common.c tests/p3/test_p3_main.c tests/p3/test_pool.c
+P3_OBJS = $(P3_SRCS:.c=.o)
+
+.PHONY: all test bench compare-pool clean libobjs test-tsan test-asan
+
+all: test_p3
+
+libobjs: $(LIB_OBJ)
+
+test_p3: $(LIB_OBJ) $(P3_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(LIB_OBJ) $(P3_OBJS) $(LDFLAGS)
+
+test: test_p3
+	./test_p3
+
+test-tsan:
+	$(MAKE) -f Makefile.p3 clean
+	$(MAKE) -f Makefile.p3 tsan-preinit
+	$(MAKE) -f Makefile.p3 test_p3 \
+		CFLAGS='$(CFLAGS) $(TSAN_CFLAGS)' \
+		LDFLAGS='$(LDFLAGS) $(TSAN_LDFLAGS)'
+	./test_p3
+
+test-asan:
+	$(MAKE) -f Makefile.p3 clean test_p3 \
+		CFLAGS='$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer' \
+		LDFLAGS='$(LDFLAGS) -fsanitize=address'
+	ASAN_OPTIONS=detect_stack_use_after_return=1 ./test_p3
+
+p3_coroutine_perclass.o: coroutine.c
+	$(CC) $(CFLAGS) -DCO_POOL_PER_CLASS=1 -c -o $@ $<
+
+p3_coroutine_global.o: coroutine.c
+	$(CC) $(CFLAGS) -DCO_POOL_PER_CLASS=0 -c -o $@ $<
+
+tests/p3/bench_pool_perclass.o: tests/p3/bench_pool.c
+	$(CC) $(CFLAGS) -DCO_POOL_PER_CLASS=1 -c -o $@ $<
+
+tests/p3/bench_pool_global.o: tests/p3/bench_pool.c
+	$(CC) $(CFLAGS) -DCO_POOL_PER_CLASS=0 -c -o $@ $<
+
+bench_pool_perclass: p3_coroutine_perclass.o platform/Linux_x86/SystemV.o \
+                     platform/Linux_x86/sysV.o tests/p3/bench_pool_perclass.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bench_pool_global: p3_coroutine_global.o platform/Linux_x86/SystemV.o \
+                   platform/Linux_x86/sysV.o tests/p3/bench_pool_global.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bench compare-pool: bench_pool_perclass bench_pool_global
+	@echo '=== 8 per class ==='
+	./bench_pool_perclass
+	@echo '=== 8 total ==='
+	./bench_pool_global
+
+tests/p3/%.o: tests/p3/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+tests/p0/%.o: tests/p0/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+platform/Linux_x86/%.o: platform/Linux_x86/%.S
+	$(CC) $(ASFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(LIB_OBJ) $(P3_OBJS) test_p3 \
+	      p3_coroutine_perclass.o p3_coroutine_global.o \
+	      tests/p3/bench_pool_perclass.o tests/p3/bench_pool_global.o \
+	      bench_pool_perclass bench_pool_global
+	rm -rf $(TSAN_PREINIT_DIR)

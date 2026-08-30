@@ -6,7 +6,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-
 struct co_stack {
     void   *base;
     void   *lo, *hi;
@@ -55,10 +54,22 @@ struct coroutine {
     size_t            asan_stack_size;
     void             *asan_fake_stack;   /* start_switch 保存；finish_switch 還原 */
 #endif
+#ifdef __SANITIZE_THREAD__
+#  define CO_TSAN_FIELDS 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_TSAN_FIELDS 1
+#  endif
+#endif
+#ifdef CO_TSAN_FIELDS
+    void             *tsan_fiber; /* 非 main：__tsan_create_fiber；main：get_current */
+#endif
     struct co_defer_entry defer[CO_DEFER_SLOTS];
     unsigned defer_count;
     int defer_running;
 };
+
+
 
 void co_context_switch(struct co_context *from, struct co_context *to);
 void co_trampoline_entry(void);
@@ -74,5 +85,10 @@ int  co_stack_create(struct co_stack *s, size_t want);
 int  co_stack_create_from(struct co_stack *s, void *base, size_t total);
 void co_stack_destroy(struct co_stack *s);
 void initialize_context(struct coroutine *co);
+
+/* P3 pool 計數：hit=重用，miss=mmap 路徑，drop=池滿而 munmap */
+void co_pool_debug_stats(unsigned long long *hit, unsigned long long *miss,
+                         unsigned long long *drop);
+void co_pool_debug_stats_reset(void);
 
 #endif /* COROUTINE_INTERNAL_H */

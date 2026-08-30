@@ -49,6 +49,62 @@
 #  define CO_ASAN_FIBER 0
 #endif
 
+/*
+ * TSan fiber 註解（僅 -fsanitize=thread；非 sanitizer 建置零開銷）
+ * ----------------------------------------------------------------
+ * LLVM 契約：create 後、context_switch 前 switch_to(to, flags=0)；
+ * destroy 在釋放控制塊前。TLS main 用 get_current_fiber，不 create／不 destroy。
+ * 切換帶 happens-before；不關 stack pool。
+ */
+#ifdef __SANITIZE_THREAD__
+#  define CO_TSAN_FIBER 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CO_TSAN_FIBER 1
+#  endif
+#endif
+#ifndef CO_TSAN_FIBER
+#  define CO_TSAN_FIBER 0
+#endif
+
+#if CO_TSAN_FIBER
+extern void *__tsan_get_current_fiber(void);
+extern void *__tsan_create_fiber(unsigned flags);
+extern void  __tsan_destroy_fiber(void *fiber);
+extern void  __tsan_switch_to_fiber(void *fiber, unsigned flags);
+#endif
+
+static void co_tsan_fiber_create(struct coroutine *co)
+{
+#if CO_TSAN_FIBER
+    co->tsan_fiber = __tsan_create_fiber(0);
+#else
+    (void)co;
+#endif
+}
+
+static void co_tsan_fiber_destroy(struct coroutine *co)
+{
+#if CO_TSAN_FIBER
+    if (!co || !co->tsan_fiber)
+        return;
+    __tsan_destroy_fiber(co->tsan_fiber);
+    co->tsan_fiber = NULL;
+#else
+    (void)co;
+#endif
+}
+
+static void co_tsan_switch_to(const struct coroutine *to_co)
+{
+#if CO_TSAN_FIBER
+    if (to_co && to_co->tsan_fiber)
+        __tsan_switch_to_fiber(to_co->tsan_fiber, 0);
+#else
+    (void)to_co;
+#endif
+}
+
 #if CO_ASAN_FIBER
 extern void __sanitizer_start_switch_fiber(void **fake_stack_save,
                                            const void *bottom,
@@ -97,6 +153,7 @@ static void co_do_switch(struct co_context *from, struct co_context *to,
                          struct coroutine *from_co, struct coroutine *to_co)
 {
     co_asan_start_switch(from_co, to_co);
+    co_tsan_switch_to(to_co);
     co_context_switch(from, to);
     /* 回到 from：還原 from 離開時保存的 fake stack */
     co_asan_finish_switch(from_co);
@@ -112,7 +169,7 @@ static void co_do_switch(struct co_context *from, struct co_context *to,
                          struct coroutine *from_co, struct coroutine *to_co)
 {
     (void)from_co;
-    (void)to_co;
+    co_tsan_switch_to(to_co);
     co_context_switch(from, to);
 }
 
@@ -137,6 +194,199 @@ static CO_THREAD_LOCAL struct coroutine *current_coroutine;
 static CO_THREAD_LOCAL struct coroutine *g_transfer_from; /* 上次切出方；供 transfer prev / ASan */
 static CO_THREAD_LOCAL struct coroutine *g_live_head; /* per-thread 雙向鏈頭 */
 static CO_THREAD_LOCAL int               tls_defer_running;
+
+/*
+ * P3a stack pool：每執行緒、每 size class 一條 LIFO（預設每檔 8 塊）。
+ * -DCO_POOL_PER_CLASS=0 改為全 class 合計 8 塊（舊上限，供對照）。
+ * 池存 co_stack metadata 複本；>512KiB、external、ASan 不進池。
+ *
+ * 池內 mmap 不在 live list 上。live list 空時不可 disarm TSD/FLS，
+ * 否則 thread-exit 解構子不跑、co_pool_drain 不會執行。
+ */
+#ifndef CO_POOL_SLOTS
+#  define CO_POOL_SLOTS 8
+#endif
+#ifndef CO_POOL_PER_CLASS
+#  define CO_POOL_PER_CLASS 1
+#endif
+#define CO_POOL_NCLASS 6
+
+struct co_stack_pool {
+    struct co_stack slot[CO_POOL_NCLASS][CO_POOL_SLOTS];
+    unsigned        n[CO_POOL_NCLASS];
+};
+
+static CO_THREAD_LOCAL struct co_stack_pool g_pool;
+static CO_THREAD_LOCAL unsigned long long g_pool_hit;
+static CO_THREAD_LOCAL unsigned long long g_pool_miss;
+static CO_THREAD_LOCAL unsigned long long g_pool_drop;
+
+#if !CO_ASAN_FIBER
+static size_t co_stack_usable(const struct co_stack *s)
+{
+    if (!s || !s->lo || !s->hi || s->hi <= s->lo)
+        return 0;
+    return (size_t)((char *)s->hi - (char *)s->lo);
+}
+
+/* 16K/32K/64K/128K/256K/512K；更大回 -1（不進池） */
+static int co_pool_class(size_t n)
+{
+    static const size_t k[CO_POOL_NCLASS] = {
+        16u * 1024u, 32u * 1024u, 64u * 1024u,
+        128u * 1024u, 256u * 1024u, 512u * 1024u
+    };
+    unsigned i;
+
+    if (n == 0)
+        return -1;
+    for (i = 0; i < CO_POOL_NCLASS; i++) {
+        if (n <= k[i])
+            return (int)i;
+    }
+    return -1;
+}
+
+#if !CO_POOL_PER_CLASS
+static unsigned co_pool_occupied(void)
+{
+    unsigned i, t = 0;
+
+    for (i = 0; i < CO_POOL_NCLASS; i++)
+        t += g_pool.n[i];
+    return t;
+}
+#endif
+#endif /* !CO_ASAN_FIBER */
+
+static void co_orphan_sync_key(void);
+
+static int co_pool_has_cached(void)
+{
+    unsigned c;
+
+    for (c = 0; c < CO_POOL_NCLASS; c++) {
+        if (g_pool.n[c])
+            return 1;
+    }
+    return 0;
+}
+
+static void co_pool_drain(void)
+{
+    unsigned c, i;
+
+    for (c = 0; c < CO_POOL_NCLASS; c++) {
+        for (i = 0; i < g_pool.n[c]; i++)
+            co_stack_destroy(&g_pool.slot[c][i]);
+        g_pool.n[c] = 0;
+    }
+    co_orphan_sync_key();
+}
+
+void co_pool_debug_stats(unsigned long long *hit, unsigned long long *miss,
+                         unsigned long long *drop)
+{
+    if (hit)
+        *hit = g_pool_hit;
+    if (miss)
+        *miss = g_pool_miss;
+    if (drop)
+        *drop = g_pool_drop;
+}
+
+void co_pool_debug_stats_reset(void)
+{
+    g_pool_hit = 0;
+    g_pool_miss = 0;
+    g_pool_drop = 0;
+}
+
+#if CO_ASAN_FIBER
+static int co_pool_take(struct co_stack *out, size_t want)
+{
+    (void)out;
+    (void)want;
+    g_pool_miss++;
+    return -1;
+}
+
+static void co_pool_give(struct co_stack *s)
+{
+    if (s && s->base)
+        g_pool_drop++;
+    co_stack_destroy(s);
+}
+#else
+static int co_pool_take(struct co_stack *out, size_t want)
+{
+    int cls = co_pool_class(want);
+    unsigned n, i;
+
+    if (!out || cls < 0)
+        return -1;
+    n = g_pool.n[cls];
+    if (n == 0) {
+        g_pool_miss++;
+        return -1;
+    }
+
+    for (i = n; i-- > 0; ) {
+        size_t usable = co_stack_usable(&g_pool.slot[cls][i]);
+        if (usable >= want) {
+            *out = g_pool.slot[cls][i];
+            g_pool.n[cls] = n - 1;
+            if (i != n - 1)
+                g_pool.slot[cls][i] = g_pool.slot[cls][n - 1];
+            memset(&g_pool.slot[cls][n - 1], 0,
+                   sizeof g_pool.slot[cls][n - 1]);
+#ifdef CO_DEBUG_STACK_USAGE
+            memset(out->lo, 0xCD, usable);
+#endif
+            g_pool_hit++;
+            return 0;
+        }
+    }
+    g_pool_miss++;
+    return -1;
+}
+
+static int co_pool_at_cap(int cls)
+{
+#if CO_POOL_PER_CLASS
+    return g_pool.n[cls] >= CO_POOL_SLOTS;
+#else
+    (void)cls;
+    return co_pool_occupied() >= CO_POOL_SLOTS;
+#endif
+}
+
+static void co_pool_give(struct co_stack *s)
+{
+    int cls;
+
+    if (!s || !s->base) {
+        if (s)
+            memset(s, 0, sizeof *s);
+        return;
+    }
+    if (s->external) {
+        co_stack_destroy(s);
+        return;
+    }
+    cls = co_pool_class(co_stack_usable(s));
+    if (cls < 0 || co_pool_at_cap(cls)) {
+        g_pool_drop++;
+        co_stack_destroy(s);
+        return;
+    }
+    g_pool.slot[cls][g_pool.n[cls]] = *s;
+    g_pool.n[cls]++;
+    memset(s, 0, sizeof *s);
+    /* unlink 可能已在 give 前把 TSD/FLS disarm；池非空時要重新 armed。 */
+    co_orphan_sync_key();
+}
+#endif
 
 static uint64_t co_self_thread_id(void)
 {
@@ -176,6 +426,7 @@ static void co_orphan_reclaim_all(void)
             leaked++;
         co_internal_reclaim_orphan(co);
     }
+    co_pool_drain();
     if (leaked > 0) {
         fprintf(stderr,
                 "coroutine orphan: owner thread exited with %zu suspended "
@@ -237,6 +488,15 @@ static void co_orphan_disarm(void)
 }
 #endif
 
+/* live list 或 stack pool 任一仍持有庫資源時保持 thread-exit 安全網。 */
+static void co_orphan_sync_key(void)
+{
+    if (g_live_head || co_pool_has_cached())
+        co_orphan_arm();
+    else
+        co_orphan_disarm();
+}
+
 #if !defined(_WIN32)
 static void co_register_process_atexit(void)
 {
@@ -275,8 +535,8 @@ static void co_live_unlink(struct coroutine *co)
     co->live_prev = NULL;
     co->live_next = NULL;
 
-    if (!g_live_head)
-        co_orphan_disarm();
+    /* 池內 stack 不在 live list：空鏈不足以證明本執行緒已無庫資源。 */
+    co_orphan_sync_key();
 }
 
 static void ensure_initialized(void)
@@ -296,6 +556,9 @@ static void ensure_initialized(void)
                 main_coroutine.asan_stack_size   = sz;
             }
         }
+#endif
+#if CO_TSAN_FIBER
+        main_coroutine.tsan_fiber = __tsan_get_current_fiber();
 #endif
     }
 }
@@ -449,7 +712,8 @@ static void co_release_owned(struct coroutine *co)
 
     co_live_unlink(co);
     co_run_defers(co);
-    co_stack_destroy(&co->stack);
+    co_tsan_fiber_destroy(co);
+    co_pool_give(&co->stack);
     co->owner_id = 0; /* 降低 UAF 誤判為同 owner 的機率（非完整 poison） */
     co_mem_free_with(&snap, co, sizeof *co);
 }
@@ -478,9 +742,12 @@ static void co_internal_reclaim_orphan(struct coroutine *co)
      * TLS/atexit 可能仍在這塊 mmap 上執行。munmap 腳下會在返回時 SIGSEGV
      * （exit() 自協程、以及在 fiber 上跑 TSD/FLS 的 libc）。略過 unmap，
      * 讓行程結束回收 VMA；控制塊仍可釋放（在 heap）。
+     * TSan fiber 同樣不可在「目前就在這條 fiber 上」時 destroy。
      */
-    if (!co_frame_on_stack(&co->stack, sp))
+    if (!co_frame_on_stack(&co->stack, sp)) {
+        co_tsan_fiber_destroy(co);
         co_stack_destroy(&co->stack);
+    }
     co->owner_id = 0;
     co_mem_free_with(&snap, co, sizeof *co);
 }
@@ -669,7 +936,8 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     /* 快照當前 allocator；destroy 永遠用此副本，不依賴之後的 co_set_allocator */
     co->allocator = g_allocator;
 
-    if (co_stack_create(&co->stack, stack_size) != 0) {
+    if (co_pool_take(&co->stack, stack_size) != 0 &&
+        co_stack_create(&co->stack, stack_size) != 0) {
         co_allocator snap = co->allocator;
         co_mem_free_with(&snap, co, sizeof *co);
         return CO_RESULT_OUT_OF_MEMORY;
@@ -680,6 +948,7 @@ co_result co_create_ex(size_t stack_size, co_function function, void *userdata,
     co->owner_id  = co_self_thread_id();
 
     initialize_context(co);
+    co_tsan_fiber_create(co);
     co_live_link(co);
     *out = co;
     return CO_RESULT_OK;
@@ -961,6 +1230,8 @@ co_result co_thread_shutdown(size_t *leaked_count)
         }
         co = next;
     }
+
+    co_pool_drain();
 
     if (leaked_count)
         *leaked_count = leaked;

@@ -430,6 +430,7 @@ void test_defer_orphan_reclaim(void)
     p0_expect(__LINE__, "orphan ran defer", g_defer_runs, 1);
 }
 
+#if !CO_TEST_TSAN
 static int run_main_atexit_capture(char *buf, size_t buf_sz)
 {
     int pipefd[2];
@@ -479,9 +480,14 @@ static int run_main_atexit_capture(char *buf, size_t buf_sz)
         return -1;
     return 0;
 }
+#endif
 
 void test_defer_main_atexit(void)
 {
+#if CO_TEST_TSAN
+    fprintf(stderr, "SKIP defer-atexit: fork-based capture is unsupported under TSan\n");
+    return;
+#else
     char buf[2048];
 
     if (run_main_atexit_capture(buf, sizeof buf) != 0) {
@@ -495,13 +501,14 @@ void test_defer_main_atexit(void)
                 buf);
         g_p0_failures++;
     }
+#endif
 }
 
 /*
  * D-10 ASan 負向測：READY 預登已結束的 caller local，co_destroy 路徑應報
  * stack-use-after-return。非 ASan 建置 SKIP（不會 abort）。
  */
-#if defined(__SANITIZE_ADDRESS__)
+#if CO_TEST_ASAN
 
 static void defer_touch_uar(void *p)
 {
@@ -594,7 +601,7 @@ void test_defer_asan_uar_destroy(void)
 #endif
 }
 
-#else /* !__SANITIZE_ADDRESS__ */
+#else /* !CO_TEST_ASAN */
 
 void test_defer_asan_uar_destroy(void)
 {

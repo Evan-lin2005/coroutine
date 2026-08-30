@@ -24,12 +24,19 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_ADDRESS__)
+#if CO_TEST_ASAN
 void test_guard_overflow(void)
 {
     fprintf(stderr,
             "SKIP test_guard_overflow: crash handler is a no-op under ASan\n");
     p0_log("H3", "test_guard.c:test_guard_overflow", "skipped under ASan", "{}");
+}
+#elif CO_TEST_TSAN
+void test_guard_overflow(void)
+{
+    fprintf(stderr,
+            "SKIP test_guard_overflow: fork+SIGSEGV is unsupported under TSan\n");
+    p0_log("H3", "test_guard.c:test_guard_overflow", "skipped under TSan", "{}");
 }
 #else
 static const char k_guard_msg[] = "coroutine stack overflow (guard page hit)";
